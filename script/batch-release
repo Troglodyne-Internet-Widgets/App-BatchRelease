@@ -1,0 +1,145 @@
+#!perl
+use 5.040;
+use warnings FATAL => 'all';
+use re '/aasx';
+
+# PODNAME: batch-release
+# ABSTRACT: Release every Dist::Zilla distribution of a set of checkouts whose work is not all on CPAN
+
+use App::BatchRelease();
+
+exit App::BatchRelease->new->run(@ARGV);
+
+__END__
+
+=head1 SYNOPSIS
+
+    batch-release [--dry-run] [--conformant-only] [--credentials] [--yes]
+                  [--skip-login-check] CHECKOUT...
+
+    batch-release --dry-run ~/src/*
+    batch-release --conformant-only ~/src/*
+    printf 'username: %s\npassword: %s\n\n' "$PAUSE_USER" "$PAUSE_PASSWORD" \
+        | batch-release --credentials --yes ~/src/*
+
+=head1 DESCRIPTION
+
+Each CHECKOUT is a directory.  For each one, C<batch-release> finds out
+whether it is a Dist::Zilla distribution whose work is not all on CPAN, as
+L<App::BatchRelease::State> says, and releases all such distributions in one
+run, with C<dzil release> in each checkout.  It asks for the PAUSE username
+and password once, before the first build, and uses them for every upload.
+
+It looks at each checkout first, and changes none while it looks:
+
+=over
+
+=item *
+
+A path that is not a directory, has no F<dist.ini>, or is not the top of a
+git checkout is skipped.  So is a distribution whose F<dist.ini> is not
+committed on the default branch.
+
+=item *
+
+The F<dist.ini> gives the name and the version.  MetaCPAN says which versions
+of the distribution it has.  The tag of the version, C<$version> or
+C<v$version>, is compared with the default branch.  A distribution that
+MetaCPAN does not have, or whose version MetaCPAN does not have, is due.  A
+distribution with commits after the tag of its version is due when the next
+release gets a new version from the tags, as with C<[Git::NextVersion]>.
+When the version is written in F<dist.ini>, it is skipped, with the advice to
+raise the version, because PAUSE refuses a version a second time.
+
+=item *
+
+A distribution that is due is still skipped when its checkout is not on the
+default branch, or has changes that are not committed, because C<dzil
+release> releases the work tree.  With C<--conformant-only>, it is skipped
+when it is not in full conformance, as L<Dist::Conformance> defines it.
+
+=back
+
+Then it prints the distributions to release, in an order where each comes
+after the ones of the batch that it requires, and the ones it skips, each with
+the reason.  The requirements come from the code, F<dist.ini> and
+F<prereqs.yml>, without a build; see L<App::BatchRelease::Prereqs>.  A dry
+run stops here.
+
+Else it asks for confirmation, then for the PAUSE username and password, and
+checks them with PAUSE.  Then it releases the distributions, one at a time, in
+order.  The output of each C<dzil release> shows as it runs.  When a release
+fails, the distributions of the batch that require it are skipped, and the
+others are still released.  At the end it prints a summary of the
+distributions released, skipped, with the reason, and failed, with the error.
+
+=head1 OPTIONS
+
+=over
+
+=item --dry-run, -n
+
+Prints what it would release, in order, with the state of each, and what it
+would skip, and stops.  It builds, tags, commits and uploads nothing, reads
+nothing from standard input and asks for nothing.
+
+=item --conformant-only
+
+Skips each distribution that is not in full conformance: one for which
+C<conformance check> of L<Dist::Conformance> would report a failure, or
+could not run, as when the checkout has no F<.conformance.yml>.
+
+=item --credentials
+
+Reads the PAUSE credentials from standard input, before anything else, as a
+block of C<name: value> lines that ends at a blank line or at the end of the
+input.  The names are C<username> and C<password>.  A name that the block does
+not give is asked for at F</dev/tty>, and so is the confirmation, because
+standard input is spoken for.  See L<App::BatchRelease::Credentials>.
+
+=item --yes, -y
+
+Releases without asking for confirmation.  A run with no terminal needs it.
+
+=item --skip-login-check
+
+Does not check the credentials with PAUSE before the first build.
+
+=item --help, -h
+
+Prints this.
+
+=back
+
+=head1 THE CREDENTIALS
+
+The credentials stay in the memory of this program.  None is written to a
+file, put on a command line or in the environment.  Each release runs in a
+child process, made with C<fork>, which has them from its parent, and which
+hands them to the C<[UploadToCPAN]> plugin of the distribution before the
+release starts.  See L<App::BatchRelease::Release/HOW THE CREDENTIALS REACH
+UPLOADTOCPAN>.
+
+The plugins of a distribution can still ask questions of their own, such as
+C<[ConfirmRelease]>, which asks before each upload.  With no terminal, it
+takes its default, which is no, unless C<DZIL_CONFIRMRELEASE_DEFAULT> is
+true.
+
+=head1 EXIT STATUS
+
+0 when nothing failed, also when nothing was due or the person did not
+confirm.  1 when a release failed.  2 for a mistake in the arguments, or a run
+that stopped before the first release, such as an unanswered question or
+credentials that PAUSE refused.
+
+=head1 SEE ALSO
+
+L<App::BatchRelease>
+
+L<App::BatchRelease::State>
+
+L<Dist::Conformance>
+
+L<Dist::Zilla::Plugin::UploadToCPAN>
+
+=cut
