@@ -108,7 +108,7 @@ writes one or the other, by its C<tag_format>.
 
 The default branch has commits after the tag of this version.  C<tag> is the
 tag, C<ahead_by> the count of those commits, and C<commits> what
-L</compare> gave of them.
+C<compare> of the source gave of them, as L</THE SOURCE> says.
 
 =item C<released>
 

@@ -51,7 +51,7 @@ every child inherits.  A file has to be created, given its mode and deleted,
 with no failure in between.  A pipe exists only while the two ends talk.
 
 Nothing reads the block until something calls L</load>, which the option
-C<--credentials> of L<batch-release> does.  A read that nobody asked for
+C<--credentials> of C<batch-release> does.  A read that nobody asked for
 hangs when the caller has nothing to give and never closes its end.
 
 =attr username

@@ -31,7 +31,7 @@ use App::BatchRelease::State();
 
 =head1 DESCRIPTION
 
-This is the program L<batch-release>.  Its POD says how a person uses it.
+This is the program C<batch-release>.  Its POD says how a person uses it.
 This page says what each part does, for a caller and for a test.
 
 A run has four steps:

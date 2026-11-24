@@ -126,7 +126,7 @@ sub default_branch ($self) {
 
 =method compare
 
-C<($tag, $branch)>.  As L<App::BatchRelease::State/compare>: undef when the tag
+C<($tag, $branch)>.  As C<compare> in L<App::BatchRelease::State/THE SOURCE>: undef when the tag
 does not exist, else C<ahead_by> and every one of C<commits>, each with an
 undef C<url>.
 
