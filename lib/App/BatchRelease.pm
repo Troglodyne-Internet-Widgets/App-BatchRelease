@@ -151,8 +151,8 @@ Returns a hash reference of C<release>, the entries to release, in order,
 and C<skipped>, the entries to skip, in the order of the paths.  An entry is
 what L</inspect> returns, and an entry to release has C<needs> too, the
 names of the distributions of the batch that it requires.  A distribution
-that the batch cannot order, because its requirements in the batch form a
-cycle, is skipped.  So is one whose requirements cannot be read, and a
+whose requirements in the batch form a cycle is skipped, and so is one that
+requires such a distribution, directly or through others.  So is one whose requirements cannot be read, and a
 second checkout of a distribution that an earlier path already gave.
 
 =cut
@@ -181,7 +181,10 @@ sub plan ( $self, @paths ) {
     }
     my $order = App::BatchRelease::Prereqs::order( \%graph );
     for my $name ( sort keys %{ $order->{cycles} } ) {
-        push @skipped, { %{ $due{$name} }, skip => 'requires ' . join( ', ', @{ $order->{cycles}{$name} } ) . ' of this batch, and their requirements form a cycle, so no order puts each after the ones it requires' };
+        push @skipped, { %{ $due{$name} }, skip => 'its requirements form a cycle with ' . join( ', ', @{ $order->{cycles}{$name} } ) . ' of this batch, so no order puts each after the ones it requires' };
+    }
+    for my $name ( sort keys %{ $order->{blocked} } ) {
+        push @skipped, { %{ $due{$name} }, skip => 'requires ' . join( ', ', @{ $order->{blocked}{$name} } ) . ' of this batch, which cannot be released, because of a cycle of requirements' };
     }
     my @release = map { +{ %{ $due{$_} }, needs => $order->{needs}{$_} } } @{ $order->{order} };
     return { release => \@release, skipped => \@skipped };

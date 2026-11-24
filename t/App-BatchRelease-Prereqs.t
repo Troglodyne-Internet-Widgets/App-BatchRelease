@@ -63,19 +63,23 @@ subtest order => sub {
         'Test-Free' => { provides => ['Test::Free'], requires => [] },
     );
     my $plan = App::BatchRelease::Prereqs::order( \%dists );
-    is( $plan->{order},  [qw{Test-Base Test-Free Test-Util Test-App}],                                                                    'each after what it requires, and by name among those free to go' );
-    is( $plan->{needs},  { 'Test-App' => [qw{Test-Base Test-Util}], 'Test-Util' => ['Test-Base'], 'Test-Base' => [], 'Test-Free' => [] }, 'what each requires of the batch; a module it provides itself does not count' );
-    is( $plan->{cycles}, {},                                                                                                              'no cycle' );
+    is( $plan->{order},                                        [qw{Test-Base Test-Util Test-App Test-Free}],                                                                    'each after what it requires, in an order that the same batch repeats' );
+    is( App::BatchRelease::Prereqs::order( \%dists )->{order}, $plan->{order},                                                                                                  'as it does on a second run' );
+    is( $plan->{needs},                                        { 'Test-App' => [qw{Test-Base Test-Util}], 'Test-Util' => ['Test-Base'], 'Test-Base' => [], 'Test-Free' => [] }, 'what each requires of the batch; a module it provides itself does not count' );
+    is( $plan->{cycles},                                       {},                                                                                                              'no cycle' );
+    is( $plan->{blocked},                                      {},                                                                                                              'and nothing held back by one' );
 
     my %cycle = (
         'Test-One'   => { provides => ['Test::One'],   requires => ['Test::Two'] },
         'Test-Two'   => { provides => ['Test::Two'],   requires => ['Test::One'] },
         'Test-Three' => { provides => ['Test::Three'], requires => ['Test::Two'] },
         'Test-Four'  => { provides => ['Test::Four'],  requires => [] },
+        'Test-Five'  => { provides => ['Test::Five'],  requires => [qw{Test::Three Test::Four}] },
     );
     $plan = App::BatchRelease::Prereqs::order( \%cycle );
-    is( $plan->{order},  ['Test-Four'],                                                                            'only what is outside the cycle and does not depend on it' );
-    is( $plan->{cycles}, { 'Test-One' => ['Test-Two'], 'Test-Two' => ['Test-One'], 'Test-Three' => ['Test-Two'] }, 'the cycle, and what depends on it, with the requirements that hold each back' );
+    is( $plan->{order},   ['Test-Four'], 'only what is outside the cycle and does not depend on it' );
+    is( $plan->{cycles},  { 'Test-One'   => ['Test-Two'], 'Test-Two'  => ['Test-One'] },   'the cycle alone, each with the others of its cycle' );
+    is( $plan->{blocked}, { 'Test-Three' => ['Test-Two'], 'Test-Five' => ['Test-Three'] }, 'and what requires it, directly or through another, with only the requirements that hold each back' );
 };
 
 done_testing;

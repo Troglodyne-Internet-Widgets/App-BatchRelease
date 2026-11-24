@@ -9,7 +9,7 @@ use re '/aasx';
 
 use Config::INI::Reader();
 use File::Find();
-use List::Util();
+use Graph();
 use Module::Metadata();
 use Mojo::File();
 use Perl::PrereqScanner();
@@ -128,8 +128,8 @@ L</requires> return them.  Returns a hash reference of:
 =item C<order>
 
 The names of the distributions that can be released, each after every
-distribution of the batch that it requires.  Among the ones that are free to
-go, the order is by name, so the answer is the same on every run.
+distribution of the batch that it requires.  The same batch gives the same
+order on every run.
 
 =item C<needs>
 
@@ -138,10 +138,14 @@ that it requires, sorted.
 
 =item C<cycles>
 
-A hash from the name of each distribution that cannot be ordered, because
-it requires itself through others of the batch, or requires one that does, to
-the names of the distributions of the batch that it requires and that
-are not in C<order>.
+A hash from the name of each distribution that requires itself through others
+of the batch, to the names of the others of its cycle, sorted.
+
+=item C<blocked>
+
+A hash from the name of each distribution outside a cycle that requires one
+in a cycle, directly or through others, to the names of the distributions of
+the batch that it requires and that are not in C<order>, sorted.
 
 =back
 
@@ -161,23 +165,35 @@ sub order ($dists) {
         $needs{$name} = [ sort keys %on ];
     }
 
-    my ( @order, %done );
-    my @waiting = sort keys %$dists;
-    while (1) {
-        my ($next) = grep {
-            my $name = $_;
-            List::Util::all { $done{$_} } @{ $needs{$name} }
-        } @waiting;
-        last if !defined $next;
-        push @order, $next;
-        $done{$next} = 1;
-        @waiting = grep { $_ ne $next } @waiting;
+    # An edge from each distribution to each one that it requires.
+    my $graph = Graph->new( directed => 1 );
+    $graph->add_vertices( keys %$dists );
+    for my $name ( keys %needs ) {
+        for my $need ( @{ $needs{$name} } ) {
+            $graph->add_edge( $name, $need );
+        }
     }
-    my %cycles = map {
+
+    my %cycles;
+    for my $component ( grep { @$_ > 1 } $graph->strongly_connected_components ) {
+        for my $name (@$component) {
+            $cycles{$name} = [ sort grep { $_ ne $name } @$component ];
+        }
+    }
+    my @blocked = grep { !$cycles{$_} } $graph->all_predecessors( keys %cycles );
+
+    my $free = $graph->copy;
+    $free->delete_vertices( keys %cycles, @blocked );
+
+    # The edges point at what a distribution requires, so the sort puts each
+    # before it, and the reverse after.  next_alphabetic makes it repeatable.
+    my @order   = reverse $free->topological_sort( next_alphabetic => 1 );
+    my %done    = map { $_ => 1 } @order;
+    my %blocked = map {
         my $name = $_;
         $name => [ grep { !$done{$_} } @{ $needs{$name} } ]
-    } @waiting;
-    return { order => \@order, needs => \%needs, cycles => \%cycles };
+    } @blocked;
+    return { order => \@order, needs => \%needs, cycles => \%cycles, blocked => \%blocked };
 }
 
 1;

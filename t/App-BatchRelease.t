@@ -17,7 +17,7 @@ use App::BatchRelease();
 # Directories that the test removes: one without dist.ini, and checkouts with one.
 my $top = File::Temp->newdir;
 my %dir;
-for my $name (qw{plain Test-Base Test-App Test-Other Test-Copy}) {
+for my $name (qw{plain Test-Base Test-App Test-Other Test-Copy Test-Late}) {
     $dir{$name} = Mojo::File->new( $top, $name )->make_path;
     $dir{$name}->child('dist.ini')->spew("name = $name\n") if $name ne 'plain';
 }
@@ -28,6 +28,7 @@ my %STATE = (
     'Test-App'   => { name => 'Test-App',   version => '1.000', state => 'never_released' },
     'Test-Other' => { name => 'Test-Other', version => '0.010', state => 'released' },
     'Test-Copy'  => { name => 'Test-Base',  version => '0.002', state => 'not_uploaded', latest => '0.001' },
+    'Test-Late'  => { name => 'Test-Late',  version => '0.001', state => 'never_released' },
 );
 
 # Fakes git and MetaCPAN for inspect: each checkout is the top of its work
@@ -130,13 +131,18 @@ subtest plan => sub {
         'the skipped ones, in the order of the paths, with a second checkout of one distribution among them'
     );
 
+    # Test-App and Test-Base require each other, and Test-Late requires
+    # Test-App.
     $prereqs->redefine( requires => sub ($root) { return Mojo::File->new($root)->basename eq 'Test-App' ? ['Test::Base'] : ['Test::App'] } );
-    $plan = App::BatchRelease->new->plan( map { "$dir{$_}" } qw{Test-App Test-Base} );
-    is( $plan->{release}, [], 'two that require each other cannot be ordered' );
+    $plan = App::BatchRelease->new->plan( map { "$dir{$_}" } qw{Test-App Test-Base Test-Late} );
+    is( $plan->{release}, [], 'two that require each other cannot be ordered, nor one that requires them' );
     is(
         [ map { $_->{skip} } @{ $plan->{skipped} } ],
-        [ map { "requires $_ of this batch, and their requirements form a cycle, so no order puts each after the ones it requires" } qw{Test-Base Test-App} ],
-        'so both are skipped, each naming what holds it back'
+        [
+            ( map { "its requirements form a cycle with $_ of this batch, so no order puts each after the ones it requires" } qw{Test-Base Test-App} ),
+            'requires Test-App of this batch, which cannot be released, because of a cycle of requirements'
+        ],
+        'so all three are skipped, the two of the cycle naming each other, and the third naming what holds it back'
     );
 
     $prereqs->redefine( requires => sub ($root) { die "Cannot read the prerequisites of $root/lib/X.pm: PPI parse failed\n" if Mojo::File->new($root)->basename eq 'Test-Base'; return ['Test::Base'] } );
