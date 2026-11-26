@@ -8,6 +8,8 @@ use Test2::Plugin::NoWarnings;
 use Test::MockModule;
 use Capture::Tiny qw{capture};
 use File::Temp();
+use List::Util();
+use Time::HiRes();
 use Mojo::File();
 use FindBin qw{$Bin};
 use FindBin::libs;
@@ -136,6 +138,48 @@ subtest inspect => sub {
     is( $app->inspect($base)->{skip}, undef, 'without conformant_only, conformance does not matter' );
     $app->conformant_only(1);
     is( $app->inspect($base)->{skip}, 'not in full conformance: GitHooks fails', 'with it, a distribution that does not conform is skipped' );
+};
+
+# Dies ten calls down, each sub calling the next.
+my $dies_deep = List::Util::reduce {
+    my $inner = $a;
+    sub { $inner->() }
+}
+sub { die "deep\n" }, 1 .. 10;
+
+subtest inspect_all => sub {
+    my @paths = map { "/bogus/$_" } qw{a b c d};
+
+    # The first path takes longest, so the children answer out of order.
+    my %delay = ( '/bogus/a' => 0.3, '/bogus/b' => 0.2, '/bogus/c' => 0.1 );
+    my $mock  = Test::MockModule->new('App::BatchRelease')->redefine(
+        inspect => sub ( $self, $path ) {
+            Time::HiRes::sleep( $delay{$path} // 0 );
+            die "boom\n" if $path eq '/bogus/d';
+            return { path => $path, pid => $$ };
+        }
+    );
+    my @entries = App::BatchRelease->new( jobs => 4 )->inspect_all(@paths);
+    is( [ map { $_->{path} } @entries ], \@paths, 'the entries come back in the order of the paths, whatever order the children finish in' );
+    my %pids = map { $_->{pid} => 1 } grep { defined $_->{pid} } @entries;
+    ok( keys(%pids) > 1 && !$pids{$$}, 'in more than one child process, and none in this one' ) or diag "this process $$, children " . join q{ }, keys %pids;
+    is( $entries[-1], { path => '/bogus/d', skip => "its check failed: boom" }, 'a path whose inspect dies is skipped with the error' );
+
+    @entries = App::BatchRelease->new( jobs => 1 )->inspect_all(@paths);
+    is( [ map { $_->{pid} } @entries[ 0 .. 2 ] ], [ ($$) x 3 ], 'with one job, every path is inspected in this process' );
+
+    $mock->redefine(
+        inspect => sub ( $self, $path ) {
+            exit 3 if $path eq '/bogus/b';
+            my $caught = !eval { $dies_deep->(); 1 };
+            return { path => $path, caught => $caught };
+        }
+    );
+    my ( undef, $err ) = capture {
+        @entries = eval { App::BatchRelease->new( jobs => 2 )->inspect_all(@paths) }
+    };
+    is( $entries[0], { path => '/bogus/a', caught => 1 },                                                            'a die that inspect catches far below its eval does not end the child, when the run started in an eval as run does' );
+    is( $entries[1], { path => '/bogus/b', skip   => 'the process that checked it ended before it gave an answer' }, 'a path whose child ends without an answer is skipped' ) or diag $err;
 };
 
 subtest sync => sub {
@@ -375,7 +419,9 @@ SUMMARY
     @WROTE                     = ();
     $git{"$dir{'Test-Base'}"}  = { divergence => [ 0, 2 ] };
     $git{"$dir{'Test-Other'}"} = { branch     => 'topic' };
-    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( '--dry-run', '--pull-latest', @paths ) };
+
+    # One job, because what a child process writes into @WROTE stays in the child.
+    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--dry-run --pull-latest --jobs 1}, @paths ) };
     is(
         [ $status, $out ],
         [

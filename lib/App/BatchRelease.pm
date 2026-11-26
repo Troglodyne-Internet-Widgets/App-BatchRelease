@@ -10,6 +10,7 @@ use Mojo::Base -base, -signatures;
 
 use Getopt::Long();
 use List::Util();
+use MCE::Loop;
 use Pod::Usage();
 
 use Dist::Conformance();
@@ -98,6 +99,11 @@ check out the default branch, and to fast-forward it with C<git pull
 Default false, and then a checkout whose default branch is behind its
 upstream is skipped.
 
+=attr jobs
+
+How many checkouts L</inspect_all> inspects at once.  Default 8.  1 inspects
+them one after another, in this process.
+
 =cut
 
 has cpan            => sub { App::BatchRelease::MetaCPAN->new };
@@ -107,6 +113,7 @@ has conformant_only => 0;
 has yes             => 0;
 has check_login     => 1;
 has pull_latest     => 0;
+has jobs            => 8;
 
 # The answers that confirm a release.
 our %YES = map { $_ => 1 } qw{y yes};
@@ -122,7 +129,7 @@ release, such as an unanswered question or credentials that PAUSE refused.
 
 sub run ( $self, @arguments ) {
     my %options;
-    my $parsed  = Getopt::Long::GetOptionsFromArray( \@arguments, \%options, qw{dry-run|n conformant-only credentials yes|y skip-login-check pull-latest help|h} );
+    my $parsed  = Getopt::Long::GetOptionsFromArray( \@arguments, \%options, qw{dry-run|n conformant-only credentials yes|y skip-login-check pull-latest jobs|j=i help|h} );
     my $problem = !$parsed ? q{} : !@arguments && !$options{help} ? "Name at least one checkout.\n" : undef;
     if ( defined $problem || $options{help} ) {
         Pod::Usage::pod2usage( -message => $problem, -exitval => 'NOEXIT', -verbose => 1, -output => defined $problem ? \*STDERR : \*STDOUT );
@@ -133,6 +140,7 @@ sub run ( $self, @arguments ) {
     $self->yes( $options{yes}                           // 0 );
     $self->check_login( $options{'skip-login-check'} ? 0 : 1 );
     $self->pull_latest( $options{'pull-latest'} // 0 );
+    $self->jobs( $options{jobs} ) if defined $options{jobs};
 
     my $result = eval {
         $self->credentials->load if $options{credentials} && !$self->dry_run;
@@ -157,7 +165,7 @@ sub run ( $self, @arguments ) {
 
 =method plan
 
-C<(@paths)>.  Looks at each path through L</inspect>, and orders the
+C<(@paths)>.  Looks at each path through L</inspect_all>, and orders the
 distributions to release through L<App::BatchRelease::Prereqs/order>.
 Returns a hash reference of C<release>, the entries to release, in order,
 and C<skipped>, the entries to skip, in the order of the paths.  An entry is
@@ -171,8 +179,7 @@ second checkout of a distribution that an earlier path already gave.
 
 sub plan ( $self, @paths ) {
     my ( %due, @skipped );
-    for my $path (@paths) {
-        my $entry = $self->inspect($path);
+    for my $entry ( $self->inspect_all(@paths) ) {
         if ( defined $entry->{skip} ) {
             push @skipped, $entry;
         }
@@ -200,6 +207,47 @@ sub plan ( $self, @paths ) {
     }
     my @release = map { +{ %{ $due{$_} }, needs => $order->{needs}{$_} } } @{ $order->{order} };
     return { release => \@release, skipped => \@skipped };
+}
+
+=method inspect_all
+
+C<(@paths)>.  Returns what L</inspect> returns for each path, in the order of
+the paths.  Up to L</jobs> child processes inspect the paths at once, each
+path in one of them, because the check of one path does not depend on
+another.  With one job, or with one path, it inspects them in this process.
+If L</inspect> dies for a path, the entry of that path is skipped with the
+error.  If the process that inspects a path ends before it returns an entry,
+the entry of that path is skipped too.
+
+=cut
+
+sub inspect_all ( $self, @paths ) {
+    my $inspect = sub ($path) {
+        my $entry = eval { $self->inspect($path) };
+        return $entry // { path => $path, skip => 'its check failed: ' . first_line($@) };
+    };
+    my $workers = List::Util::min( $self->jobs, scalar @paths );
+    if ( $workers < 2 ) {
+        my @entries;
+        for my $path (@paths) {
+            push @entries, $inspect->($path);
+        }
+        return @entries;
+    }
+
+    MCE::Loop->init( max_workers => $workers, chunk_size => 1 );
+    my %by_chunk = MCE::Loop->run(
+        sub ( $mce, $chunk, $chunk_id ) {
+
+            # The die handler of an MCE worker that starts in an eval, as run does,
+            # ends the worker on a die caught more than 7 frames below an eval.
+            local $SIG{__DIE__} = 'DEFAULT';
+            MCE->gather( $chunk_id, $inspect->( $chunk->[0] ) );
+        },
+        \@paths
+    );
+    MCE::Loop->finish;
+    return map { $by_chunk{$_} // { path => $paths[ $_ - 1 ], skip => 'the process that checked it ended before it gave an answer' } } 1 .. @paths;
 }
 
 =method inspect
