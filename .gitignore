@@ -13,3 +13,6 @@ cover_db/
 # At the root, where dzil build leaves them.  Unanchored, the pattern also
 # hides a test named after the distribution, such as t/App-BatchRelease-Foo.t.
 /App-BatchRelease-*
+
+# The worktrees that Claude Code makes for its agents, inside the checkout.
+/.claude/worktrees/

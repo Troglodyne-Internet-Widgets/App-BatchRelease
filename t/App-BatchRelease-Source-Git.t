@@ -102,6 +102,66 @@ subtest 'tags, current_branch and changes' => sub {
     is( [ $source->changes ],    [],    'a clean work tree has no changes' );
 };
 
+subtest 'tip, and file and compare at a tip' => sub {
+    fake_git(
+        'symbolic-ref --quiet --short refs/remotes/origin/HEAD'                     => [ 0, "origin/main\n" ],
+        'cat-file -p refs/remotes/origin/main:dist.ini'                             => [ 0, "name = Test-Dist\nversion = 0.003\n" ],
+        'rev-parse --verify --quiet refs/tags/0.002^{commit}'                       => [ 0, "abc\n" ],
+        'log --reverse --format=%H%x09%s refs/tags/0.002..refs/remotes/origin/main' => [ 0, "aaa\tPulled\n" ],
+    );
+    my $source = App::BatchRelease::Source::Git->new( root => $root );
+    is( $source->tip('main'), 'refs/heads/main', 'without tips, a branch is read at refs/heads/' );
+    $source->tips->{main} = 'refs/remotes/origin/main';
+    is( $source->tip('main'),                'refs/remotes/origin/main',                                                            'with tips, at the ref they give' );
+    is( $source->tip('other'),               'refs/heads/other',                                                                    'and only for the branch they name' );
+    is( $source->file('dist.ini'),           "name = Test-Dist\nversion = 0.003\n",                                                 'file reads the default branch at its tip' );
+    is( $source->compare( '0.002', 'main' ), { ahead_by => 1, commits => [ { sha => 'aaa', subject => 'Pulled', url => undef } ] }, 'so does compare' );
+};
+
+subtest upstream => sub {
+    my $format = 'for-each-ref --format=%(upstream)%09%(upstream:short)%09%(upstream:remotename)';
+    fake_git(
+        "$format refs/heads/main"  => [ 0, "refs/remotes/origin/main\torigin/main\torigin\n" ],
+        "$format refs/heads/topic" => [ 0, "refs/heads/main\tmain\t.\n" ],
+        "$format refs/heads/alone" => [ 0, "\t\t\n" ],
+        "$format refs/heads/gone"  => [ 0, q{} ],
+    );
+    my $source = App::BatchRelease::Source::Git->new( root => $root );
+    is( $source->upstream('main'),  { ref => 'refs/remotes/origin/main', name => 'origin/main', remote => 'origin' }, 'the upstream on a remote, with the remote to fetch' );
+    is( $source->upstream('topic'), { ref => 'refs/heads/main', name => 'main', remote => q{.} },                     'an upstream that is a local branch has the remote .' );
+    is( $source->upstream('alone'), undef,                                                                            'a branch with no upstream has none' );
+    is( $source->upstream('gone'),  undef,                                                                            'nor does a branch that is not there' );
+};
+
+subtest divergence => sub {
+    my $range  = 'rev-list --left-right --count refs/heads/main...refs/remotes/origin/main';
+    my $source = App::BatchRelease::Source::Git->new( root => $root );
+    for my $case ( [ "0\t0\n", 0, 0, 'neither' ], [ "0\t1\n", 0, 1, '1 behind' ], [ "3\t0\n", 3, 0, 'ahead' ], [ "1\t2\n", 1, 2, 'ahead and behind' ] ) {
+        my ( $out, $ahead, $behind, $what ) = @$case;
+        fake_git( $range => [ 0, $out ] );
+        is( [ $source->divergence( 'main', 'refs/remotes/origin/main' ) ], [ $ahead, $behind ], "$what: ahead, then behind" );
+    }
+    fake_git( $range => [ 0, "nonsense\n" ] );
+    is( dies { $source->divergence( 'main', 'refs/remotes/origin/main' ) }, "git rev-list in /bogus/Test-Dist gave no counts: nonsense\n", 'output that is not two counts dies rather than count 0' );
+};
+
+subtest 'fetch, switch and pull' => sub {
+    fake_git(
+        'fetch --quiet origin'               => [ 0, q{} ],
+        'switch --quiet main'                => [ 0, q{} ],
+        'pull --quiet --no-rebase --ff-only' => [ 0, q{} ],
+    );
+    my $source = App::BatchRelease::Source::Git->new( root => $root );
+    $source->fetch('origin');
+    $source->switch('main');
+    $source->pull;
+    is( \@ASKED, [ 'fetch --quiet origin', 'switch --quiet main', 'pull --quiet --no-rebase --ff-only' ], 'each runs its git command, and the pull can only fast-forward, whatever pull.rebase says' );
+
+    fake_git( 'pull --quiet --no-rebase --ff-only' => [ 128, q{} ], 'fetch --quiet origin' => [ 128, q{} ] );
+    is( dies { $source->pull },            "git pull --quiet --no-rebase --ff-only: exit 128\n", 'a pull that fails dies' );
+    is( dies { $source->fetch('origin') }, "git fetch --quiet origin: exit 128\n",               'so does a fetch' );
+};
+
 subtest is_checkout => sub {
     my $dir = File::Temp->newdir;
     fake_git( 'rev-parse --show-toplevel' => [ 0, "$dir\n" ] );
@@ -119,6 +179,13 @@ subtest git => sub {
     is( scalar $source->git('ok'),     'out:-C /bogus/Test-Dist ok',                      'runs in the root, and gives the standard output' );
     is( [ $source->git('fail') ],      [ 3, 'out:-C /bogus/Test-Dist fail' ],             'in list context, the exit status and the output, and no death' );
     is( dies { $source->git('fail') }, "git fail in /bogus/Test-Dist: exit 3: trouble\n", 'in scalar context, a failure dies with the status and the standard error' );
+
+    # The fake git fails, and says in its error whether it may prompt.
+    local @App::BatchRelease::Source::Git::GIT = ( $^X, '-e', 'print STDERR qq{prompt=$ENV{GIT_TERMINAL_PROMPT}}; exit 1', '--' );
+    local $ENV{GIT_TERMINAL_PROMPT} = 1;
+    is( dies { $source->fetch('origin') }, "git fetch --quiet origin in /bogus/Test-Dist: exit 1: prompt=0\n",               'fetch runs git with GIT_TERMINAL_PROMPT=0, so it fails rather than ask for a password' );
+    is( dies { $source->pull },            "git pull --quiet --no-rebase --ff-only in /bogus/Test-Dist: exit 1: prompt=0\n", 'so does pull' );
+    is( $ENV{GIT_TERMINAL_PROMPT},         1,                                                                                'and the environment of the program is as it was' );
 };
 
 done_testing;

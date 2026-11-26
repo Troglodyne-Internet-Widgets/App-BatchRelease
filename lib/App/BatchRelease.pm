@@ -40,8 +40,9 @@ A run has four steps:
 
 =item 1. L</plan>
 
-Looks at each checkout, without changing any, and sorts them into the ones
-to release, in order, and the ones to skip, each with its reason.
+Fetches each checkout and looks at it, and sorts them into the ones to
+release, in order, and the ones to skip, each with its reason.  It changes no
+work tree, unless L</pull_latest> is set and this is not a dry run.
 
 =item 2. L</listing>
 
@@ -71,8 +72,9 @@ The L<App::BatchRelease::Credentials>.
 
 =attr dry_run
 
-True to stop after the list.  Then nothing reads standard input, and nothing
-asks for credentials.
+True to stop after the list.  Then nothing reads standard input, nothing
+asks for credentials, and L</pull_latest> changes no checkout.  The fetch of
+L</sync> still runs.
 
 =attr conformant_only
 
@@ -88,6 +90,14 @@ True to release without asking for confirmation.
 True, the default, to check the credentials with PAUSE before the first
 build.  See L<App::BatchRelease::Credentials/check_with_pause>.
 
+=attr pull_latest
+
+True to bring each checkout up to its upstream before the other checks: to
+check out the default branch, and to fast-forward it with C<git pull
+--ff-only>, as L</sync> says.  On a dry run, it only says what it would do.
+Default false, and then a checkout whose default branch is behind its
+upstream is skipped.
+
 =cut
 
 has cpan            => sub { App::BatchRelease::MetaCPAN->new };
@@ -96,6 +106,7 @@ has dry_run         => 0;
 has conformant_only => 0;
 has yes             => 0;
 has check_login     => 1;
+has pull_latest     => 0;
 
 # The answers that confirm a release.
 our %YES = map { $_ => 1 } qw{y yes};
@@ -111,7 +122,7 @@ release, such as an unanswered question or credentials that PAUSE refused.
 
 sub run ( $self, @arguments ) {
     my %options;
-    my $parsed  = Getopt::Long::GetOptionsFromArray( \@arguments, \%options, qw{dry-run|n conformant-only credentials yes|y skip-login-check help|h} );
+    my $parsed  = Getopt::Long::GetOptionsFromArray( \@arguments, \%options, qw{dry-run|n conformant-only credentials yes|y skip-login-check pull-latest help|h} );
     my $problem = !$parsed ? q{} : !@arguments && !$options{help} ? "Name at least one checkout.\n" : undef;
     if ( defined $problem || $options{help} ) {
         Pod::Usage::pod2usage( -message => $problem, -exitval => 'NOEXIT', -verbose => 1, -output => defined $problem ? \*STDERR : \*STDOUT );
@@ -121,6 +132,7 @@ sub run ( $self, @arguments ) {
     $self->conformant_only( $options{'conformant-only'} // 0 );
     $self->yes( $options{yes}                           // 0 );
     $self->check_login( $options{'skip-login-check'} ? 0 : 1 );
+    $self->pull_latest( $options{'pull-latest'} // 0 );
 
     my $result = eval {
         $self->credentials->load if $options{credentials} && !$self->dry_run;
@@ -206,6 +218,12 @@ checkout, so it is not clearly a Dist::Zilla distribution;
 
 =item *
 
+L</sync> gives a reason: the fetch failed, the default branch has no
+upstream, or it is behind its upstream and L</pull_latest> cannot bring it
+up to date;
+
+=item *
+
 its F<dist.ini> is not committed on the default branch, or the check of its
 state fails;
 
@@ -226,7 +244,13 @@ problem.
 
 =back
 
-It changes nothing in the checkout.
+On a dry run, an entry that a pull would change has C<pull>, what the pull
+would do, such as C<check out main and fast-forward 2 commits>.  Then its
+state is the one that it would have after the pull.
+
+It changes nothing in the work tree of the checkout, unless
+L</pull_latest> is set and this is not a dry run.  It fetches, as L</sync>
+says.
 
 =cut
 
@@ -237,6 +261,11 @@ sub inspect ( $self, $path ) {
     my $source = App::BatchRelease::Source::Git->new( root => $path );
     return { %entry, skip => 'not the top of a git checkout' } if !$source->is_checkout;
 
+    my $sync = eval { $self->sync($source) };
+    return { %entry, skip => 'the check of its default branch against its upstream failed: ' . first_line($@) } if !$sync;
+    return { %entry, skip => $sync->{skip} }                                                                    if defined $sync->{skip};
+    $entry{pull} = $sync->{pull} if defined $sync->{pull};
+
     my $state = eval { App::BatchRelease::State::release_state( $source, $self->cpan ) };
     return { %entry, skip => 'the check of its state failed: ' . first_line($@) }    if !$state && $@;
     return { %entry, skip => 'its dist.ini is not committed on the default branch' } if !$state;
@@ -245,15 +274,120 @@ sub inspect ( $self, $path ) {
     return { %entry, skip => $reason } if defined $reason;
 
     my $branch  = $source->default_branch;
-    my $current = $source->current_branch // 'a detached head';
+    my $current = $sync->{switch} ? $branch : $source->current_branch // 'a detached head';
     return { %entry, skip => "the checkout is on $current, not on its default branch $branch" } if $current ne $branch;
     my @changes = $source->changes;
-    return { %entry, skip => scalar(@changes) . ' changed or untracked path' . ( @changes == 1 ? q{} : 's' ) . ' in the work tree, which dzil release refuses' } if @changes;
+    return { %entry, skip => changed(@changes) . ', which dzil release refuses' } if @changes;
 
     if ( $self->conformant_only && defined( my $problem = conformance_problem($path) ) ) {
         return { %entry, skip => $problem };
     }
     return \%entry;
+}
+
+=method sync
+
+C<($source)>, an L<App::BatchRelease::Source::Git>.  Brings the checkout up to
+date with its upstream, as far as it may, and says how it stands.  Returns a
+hash reference with C<skip>, the reason to skip the checkout, or else with
+what a dry run would do, if anything: C<pull>, what L</inspect> says of it,
+and C<switch>, true when it would check out the default branch.
+
+First it fetches the remote of the upstream of the default branch, on a dry
+run too, because a fetch changes no branch and no work tree.  Then it counts
+the commits of the default branch and of its upstream that the other does not
+have.  The checkout is skipped:
+
+=over
+
+=item *
+
+when the default branch has no upstream.  Then nothing can tell whether
+somebody pushed work that it does not have, so it is skipped rather than
+released on a guess.  C<git branch --set-upstream-to> gives it one.
+
+=item *
+
+when the fetch fails, because the counts would come from refs that may be
+old.
+
+=item *
+
+without L</pull_latest>, when the default branch is behind its upstream,
+because C<dzil release> would upload the old work tree, and
+C<[Git::Push]> would refuse the push after the upload.  A branch that is
+ahead is not skipped: C<[Git::Push]> pushes its commits.
+
+=item *
+
+with L</pull_latest>, when the default branch is behind and ahead at once,
+so that it cannot fast-forward, or when the checkout must change branch or
+fast-forward and has changes in the work tree.  It never stashes, merges,
+rebases or resets.
+
+=back
+
+With L</pull_latest>, a checkout that is on another branch, or a detached
+head, gets the default branch checked out, and a default branch that is
+behind is fast-forwarded with C<git pull --ff-only>.  One that is up to date
+is not pulled.  On a dry run, neither happens: C<pull> says what would, and
+the L<App::BatchRelease::Source::Git/tips> of the source points the default
+branch at its upstream, so that the state of the distribution is the one
+that the fast-forward would give.
+
+=cut
+
+sub sync ( $self, $source ) {
+    my $branch   = $source->default_branch;
+    my $upstream = $source->upstream($branch) // return { skip => "its default branch $branch has no upstream, so nothing can tell whether it is behind; git branch --set-upstream-to gives it one" };
+    my $fetched  = eval { $source->fetch( $upstream->{remote} ); 1 };
+    return { skip => "git fetch $upstream->{remote} failed, so nothing can tell whether $branch is behind $upstream->{name}: " . first_line($@) } if !$fetched;
+    my ( $ahead, $behind ) = $source->divergence( $branch, $upstream->{ref} );
+
+    my $behind_by = plural( $behind, 'commit' ) . " behind $upstream->{name}";
+    return { skip => $behind_by }                                                                                 if $behind && !$self->pull_latest;
+    return {}                                                                                                     if !$self->pull_latest;
+    return { skip => "$behind_by and " . plural( $ahead, 'commit' ) . ' ahead of it, so it cannot fast-forward' } if $behind && $ahead;
+
+    my $switch = ( $source->current_branch // q{} ) ne $branch;
+    my $pull   = join ' and ', ( $switch ? "check out $branch" : () ), ( $behind ? 'fast-forward ' . plural( $behind, 'commit' ) : () );
+    return {} if $pull eq q{};
+    my @changes = $source->changes;
+    return { skip => changed(@changes) . ", so --pull-latest cannot $pull" } if @changes;
+
+    if ( $self->dry_run ) {
+        $source->tips->{$branch} = $upstream->{ref} if $behind;
+        return { pull => $pull, switch => $switch };
+    }
+    my $pulled = eval {
+        $source->switch($branch) if $switch;
+        $source->pull            if $behind;
+        1;
+    };
+    return { skip => "--pull-latest could not $pull: " . first_line($@) } if !$pulled;
+    return {};
+}
+
+=func plural
+
+C<($count, $noun)>.  The count and the noun, with an C<s> unless the count is
+1, such as C<1 commit> and C<2 commits>.
+
+=cut
+
+sub plural ( $count, $noun ) {
+    return "$count $noun" . ( $count == 1 ? q{} : 's' );
+}
+
+=func changed
+
+C<(@changes)>, what L<App::BatchRelease::Source::Git/changes> returns.  How
+many paths of the work tree are changed or untracked, in words.
+
+=cut
+
+sub changed (@changes) {
+    return plural( scalar @changes, 'changed or untracked path' ) . ' in the work tree';
 }
 
 =func due
@@ -290,7 +424,7 @@ sub due ($state) {
     return 'CPAN has ' . ( $state->{version} // 'releases of it' ) . ', but no tag says which commit, so nothing can tell what is released' if $kind eq 'no_tag';
     return 'its dist.ini sets no version and does not load [Git::NextVersion], so nothing can tell what is released'                        if $kind eq 'no_version';
     if ( $kind eq 'unreleased_commits' && ( $state->{version_from} // q{} ) ne 'tag' ) {
-        return "$state->{ahead_by} commit" . ( $state->{ahead_by} == 1 ? q{} : 's' ) . " after the tag $state->{tag}, but dist.ini still says $state->{version}, which CPAN has: raise the version to release them";
+        return plural( $state->{ahead_by}, 'commit' ) . " after the tag $state->{tag}, but dist.ini still says $state->{version}, which CPAN has: raise the version to release them";
     }
     return;
 }
@@ -333,9 +467,9 @@ C<($entry)>.  The state of an entry to release, in words.
 
 sub describe ($entry) {
     my $state = $entry->{state};
-    return 'never released'                                                                                       if $state eq 'never_released';
-    return "not uploaded, CPAN has $entry->{latest}"                                                              if $state eq 'not_uploaded';
-    return "$entry->{ahead_by} commit" . ( $entry->{ahead_by} == 1 ? q{} : 's' ) . " after the tag $entry->{tag}" if $state eq 'unreleased_commits';
+    return 'never released'                                                        if $state eq 'never_released';
+    return "not uploaded, CPAN has $entry->{latest}"                               if $state eq 'not_uploaded';
+    return plural( $entry->{ahead_by}, 'commit' ) . " after the tag $entry->{tag}" if $state eq 'unreleased_commits';
     return $state;
 }
 
@@ -358,7 +492,8 @@ sub version_of ($entry) {
 C<($plan, $verb)>, what L</plan> returns and the words that start the list.
 The text of the plan: the distributions to release, in order, each with its
 version, its state, the distributions of the batch that it requires and its
-path, then the ones to skip, each with its reason.
+path, then the ones to skip, each with its reason.  An entry with C<pull>, from
+a dry run, says what the pull would do first.
 
 =cut
 
@@ -368,12 +503,24 @@ sub listing ( $plan, $verb ) {
     my $n       = 0;
     for my $entry (@release) {
         my @needs = @{ $entry->{needs} // [] };
-        push @lines, sprintf( '  %d. %s %s: %s%s', ++$n, $entry->{name}, version_of($entry), describe($entry), ( @needs ? '; after ' . join( ', ', @needs ) : q{} ) ), "       $entry->{path}";
+        push @lines, sprintf( '  %d. %s %s: %s%s%s', ++$n, $entry->{name}, version_of($entry), describe($entry), ( @needs ? '; after ' . join( ', ', @needs ) : q{} ), pull_note($entry) ), "       $entry->{path}";
     }
     my @skipped = @{ $plan->{skipped} };
     push @lines, 'Skipped:' if @skipped;
-    push @lines, map { my $entry = $_; '  ' . label($entry) . ": $entry->{skip}" } @skipped;
+    push @lines, map { my $entry = $_; '  ' . label($entry) . ": $entry->{skip}" . pull_note($entry) } @skipped;
     return join q{}, map { "$_\n" } @lines;
+}
+
+=func pull_note
+
+C<($entry)>.  What the pull of a dry run would do for the entry, as words to
+append to its line, such as C<; would check out main and fast-forward 2
+commits first>.  Empty when the entry has no C<pull>.
+
+=cut
+
+sub pull_note ($entry) {
+    return defined $entry->{pull} ? "; would $entry->{pull} first" : q{};
 }
 
 =func label
@@ -405,7 +552,7 @@ sub confirm ( $self, $plan ) {
         die "Nobody can confirm the release: standard input is not a terminal.\nPass --yes to release without asking.\n";
     }
     my $count  = @{ $plan->{release} };
-    my $answer = App::BatchRelease::Prompt::ask( "Release these $count distribution" . ( $count == 1 ? q{} : 's' ) . ' to CPAN? [y/N]', @at );
+    my $answer = App::BatchRelease::Prompt::ask( 'Release these ' . plural( $count, 'distribution' ) . ' to CPAN? [y/N]', @at );
     return 0 if !$answer;
     my $typed = lc "$answer";
     $typed =~ s{\A\s+|\s+\z}{}g;

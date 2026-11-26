@@ -15,9 +15,10 @@ __END__
 =head1 SYNOPSIS
 
     batch-release [--dry-run] [--conformant-only] [--credentials] [--yes]
-                  [--skip-login-check] CHECKOUT...
+                  [--skip-login-check] [--pull-latest] CHECKOUT...
 
     batch-release --dry-run ~/src/*
+    batch-release --dry-run --pull-latest ~/src/*
     batch-release --conformant-only ~/src/*
     printf 'username: %s\npassword: %s\n\n' "$PAUSE_USER" "$PAUSE_PASSWORD" \
         | batch-release --credentials --yes ~/src/*
@@ -30,15 +31,34 @@ L<App::BatchRelease::State> says, and releases all such distributions in one
 run, with C<dzil release> in each checkout.  It asks for the PAUSE username
 and password once, before the first build, and uses them for every upload.
 
-It looks at each checkout first, and changes none while it looks:
+It looks at each checkout first.  It fetches each one, and changes no work
+tree while it looks, unless C<--pull-latest> tells it to:
 
 =over
 
 =item *
 
 A path that is not a directory, has no F<dist.ini>, or is not the top of a
-git checkout is skipped.  So is a distribution whose F<dist.ini> is not
-committed on the default branch.
+git checkout is skipped.
+
+=item *
+
+It runs C<git fetch> for the remote of the upstream of the default branch, on
+a dry run too, because a fetch changes no branch and no work tree.  A
+checkout whose fetch fails is skipped, with the error.  So is one whose
+default branch has no upstream, because then nothing can tell whether
+somebody pushed work that it does not have; C<git branch
+--set-upstream-to> gives it one.  So is one whose default branch is behind
+its upstream, such as C<2 commits behind origin/main>, because C<dzil
+release> would upload the old work tree, and C<[Git::Push]> would find out
+only after the upload.  A default branch that is ahead of its upstream is
+fine: C<[Git::Push]> pushes it.  With C<--pull-latest>, the checkout is
+brought up to date instead; see L</OPTIONS>.
+
+=item *
+
+A distribution whose F<dist.ini> is not committed on the default branch is
+skipped.
 
 =item *
 
@@ -81,7 +101,22 @@ distributions released, skipped, with the reason, and failed, with the error.
 
 Prints what it would release, in order, with the state of each, and what it
 would skip, and stops.  It builds, tags, commits and uploads nothing, reads
-nothing from standard input and asks for nothing.
+nothing from standard input and asks for nothing.  It still fetches.  With
+C<--pull-latest>, it changes no checkout, and says what the pull would do.
+
+=item --pull-latest
+
+Before the other checks, brings each checkout up to its upstream.  It checks
+out the default branch, when the checkout is on another branch or a detached
+head, and fast-forwards the default branch with C<git pull --ff-only>, when
+it is behind its upstream.  A checkout that needs either and has changes in
+the work tree, changed or untracked, is skipped, and so is a default branch
+that is behind and ahead at once, which cannot fast-forward.  It never
+stashes, merges, rebases or resets.
+
+With C<--dry-run>, it does none of this.  It says what it would do, such as
+C<would check out main and fast-forward 2 commits first>, and gives the state
+that the distribution would have after the fast-forward.
 
 =item --conformant-only
 
