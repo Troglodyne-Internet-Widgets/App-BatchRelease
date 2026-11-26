@@ -44,8 +44,9 @@ git checkout is skipped.
 =item *
 
 It runs C<git fetch> for the remote of the upstream of the default branch, on
-a dry run too, because a fetch changes no branch and no work tree.  A
-checkout whose fetch fails is skipped, with the error.  So is one whose
+a dry run too, because a fetch changes no branch and no work tree.  For a
+remote over SSH, it fetches over HTTPS first, because that is faster, and over
+SSH when that fails.  A checkout whose fetch fails is skipped, with the error.  So is one whose
 default branch has no upstream, because then nothing can tell whether
 somebody pushed work that it does not have; C<git branch
 --set-upstream-to> gives it one.  So is one whose default branch is behind

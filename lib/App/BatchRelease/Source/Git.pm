@@ -252,14 +252,46 @@ sub divergence ( $self, $branch, $ref ) {
 
 C<($remote)>.  Writes.  Fetches the remote C<$remote>, as C<git fetch> does.
 It changes the refs of the remote and the tags, and no local branch or work
-tree.  It dies with the standard error of git when git fails.
+tree.
+
+When the URL of the remote is an SSH URL, it fetches over HTTPS first, from
+the URL that L</https_url> gives, because each fetch over SSH makes a new
+connection, and that costs more than a request over HTTPS.  The HTTPS
+credential, if the repository needs one, comes from the credential helper of
+git.  When that fetch fails, for any reason, it fetches over SSH, as the
+remote says.  It dies with the standard error of git when the last fetch
+fails.
 
 =cut
 
 sub fetch ( $self, $remote ) {
     local $ENV{GIT_TERMINAL_PROMPT} = 0;
+    my ( $status, $url ) = $self->git( qw{remote get-url}, $remote );
+    chomp $url;
+    my $https = $status ? undef : https_url($url);
+    return if defined $https && eval { $self->git( '-c', "url.$https.insteadOf=$url", qw{fetch --quiet}, $remote ); 1 };
     $self->git( qw{fetch --quiet}, $remote );
     return;
+}
+
+=func https_url
+
+C<($url)>.  For a git URL over SSH, the same repository over HTTPS:
+C<https://HOST/PATH> for C<USER@HOST:PATH> and for
+C<ssh://USER@HOST:PORT/PATH>, where the user and the port are optional.  It
+drops the user and the port, and it assumes that the host serves the same
+path over HTTPS, as the common forges do.  Undef for any other URL, such as
+one over HTTPS already, a C<file://> URL or a path.
+
+=cut
+
+sub https_url ($url) {
+    my ( $host, $path ) =
+        $url =~ m{\A ssh:// (?: [^@/]+ @ )? ( [^:/]+ ) (?: : \d+ )? / (.+) \z} ? ( $1, $2 )
+      : $url =~ m{\A (?: [^@/:]+ @ )? ( [^:/]+ ) : (?!//) (.+) \z}             ? ( $1, $2 )
+      :                                                                          return;
+    $path =~ s{\A /+}{};
+    return "https://$host/$path";
 }
 
 =method switch

@@ -145,9 +145,33 @@ subtest divergence => sub {
     is( dies { $source->divergence( 'main', 'refs/remotes/origin/main' ) }, "git rev-list in /bogus/Test-Dist gave no counts: nonsense\n", 'output that is not two counts dies rather than count 0' );
 };
 
+subtest https_url => sub {
+    my %cases = (
+        'git@forge.test.test:Owner/Repo.git'            => 'https://forge.test.test/Owner/Repo.git',
+        'forge.test.test:Owner/Repo.git'                => 'https://forge.test.test/Owner/Repo.git',
+        'git@forge.test.test:/Owner/Repo.git'           => 'https://forge.test.test/Owner/Repo.git',
+        'ssh://git@forge.test.test:2222/Owner/Repo.git' => 'https://forge.test.test/Owner/Repo.git',
+        'ssh://forge.test.test/Owner/Repo.git'          => 'https://forge.test.test/Owner/Repo.git',
+        'https://forge.test.test/Owner/Repo.git'        => undef,
+        'http://forge.test.test/Owner/Repo.git'         => undef,
+        'file:///bogus/Repo.git'                        => undef,
+        '/bogus/Repo.git'                               => undef,
+        '../bogus/Repo.git'                             => undef,
+        'git@forge.test.test:'                          => undef,
+    );
+    for my $url ( sort keys %cases ) {
+        is( App::BatchRelease::Source::Git::https_url($url), $cases{$url}, "$url gives " . ( $cases{$url} // 'undef' ) );
+    }
+};
+
 subtest 'fetch, switch and pull' => sub {
+    my $ssh   = 'git@forge.test.test:Owner/Repo.git';
+    my $https = 'https://forge.test.test/Owner/Repo.git';
+    my %url   = ( 'remote get-url origin' => [ 0, "$ssh\n" ] );
+    my $fast  = "-c url.$https.insteadOf=$ssh fetch --quiet origin";
     fake_git(
-        'fetch --quiet origin'               => [ 0, q{} ],
+        %url,
+        $fast                                => [ 0, q{} ],
         'switch --quiet main'                => [ 0, q{} ],
         'pull --quiet --no-rebase --ff-only' => [ 0, q{} ],
     );
@@ -155,11 +179,23 @@ subtest 'fetch, switch and pull' => sub {
     $source->fetch('origin');
     $source->switch('main');
     $source->pull;
-    is( \@ASKED, [ 'fetch --quiet origin', 'switch --quiet main', 'pull --quiet --no-rebase --ff-only' ], 'each runs its git command, and the pull can only fast-forward, whatever pull.rebase says' );
+    is( \@ASKED, [ 'remote get-url origin', $fast, 'switch --quiet main', 'pull --quiet --no-rebase --ff-only' ], 'each runs its git command, a remote over SSH is fetched over HTTPS, and the pull can only fast-forward, whatever pull.rebase says' );
 
-    fake_git( 'pull --quiet --no-rebase --ff-only' => [ 128, q{} ], 'fetch --quiet origin' => [ 128, q{} ] );
+    fake_git( %url, $fast => [ 128, q{} ], 'fetch --quiet origin' => [ 0, q{} ] );
+    $source->fetch('origin');
+    is( \@ASKED, [ 'remote get-url origin', $fast, 'fetch --quiet origin' ], 'when the fetch over HTTPS fails, it fetches over SSH, as the remote says' );
+
+    fake_git( 'remote get-url origin' => [ 0, "$https\n" ], 'fetch --quiet origin' => [ 0, q{} ] );
+    $source->fetch('origin');
+    is( \@ASKED, [ 'remote get-url origin', 'fetch --quiet origin' ], 'a remote over HTTPS is fetched once, as it says' );
+
+    fake_git( 'remote get-url .' => [ 2, q{} ], 'fetch --quiet .' => [ 0, q{} ] );
+    $source->fetch(q{.});
+    is( \@ASKED, [ 'remote get-url .', 'fetch --quiet .' ], 'a remote with no URL, such as . for a local upstream, is fetched as it is' );
+
+    fake_git( 'pull --quiet --no-rebase --ff-only' => [ 128, q{} ], %url, $fast => [ 128, q{} ], 'fetch --quiet origin' => [ 128, q{} ] );
     is( dies { $source->pull },            "git pull --quiet --no-rebase --ff-only: exit 128\n", 'a pull that fails dies' );
-    is( dies { $source->fetch('origin') }, "git fetch --quiet origin: exit 128\n",               'so does a fetch' );
+    is( dies { $source->fetch('origin') }, "git fetch --quiet origin: exit 128\n",               'so does a fetch that fails over HTTPS and over SSH, with the error of the fetch over SSH' );
 };
 
 subtest is_checkout => sub {
