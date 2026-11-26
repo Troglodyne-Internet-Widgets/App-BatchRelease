@@ -15,7 +15,7 @@ __END__
 =head1 SYNOPSIS
 
     batch-release [--dry-run] [--conformant-only] [--credentials] [--yes]
-                  [--skip-login-check] [--pull-latest] CHECKOUT...
+                  [--skip-login-check] [--pull-latest] [--jobs N] CHECKOUT...
 
     batch-release --dry-run ~/src/*
     batch-release --dry-run --pull-latest ~/src/*
@@ -117,6 +117,12 @@ stashes, merges, rebases or resets.
 With C<--dry-run>, it does none of this.  It says what it would do, such as
 C<would check out main and fast-forward 2 commits first>, and gives the state
 that the distribution would have after the fast-forward.
+
+=item --jobs N, -j N
+
+Checks up to N checkouts at once, each in a child process: the fetch, the
+state, the branch and the conformance.  Default 8.  With 1, it checks them one
+after another.  The releases themselves always run one at a time, in order.
 
 =item --conformant-only
 
