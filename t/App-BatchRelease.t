@@ -32,18 +32,52 @@ my %STATE = (
 );
 
 # Fakes git and MetaCPAN for inspect: each checkout is the top of its work
-# tree, on main, clean, unless %git says otherwise for its path.
-my %git;
+# tree, on main, clean, with the upstream origin/main, neither ahead nor
+# behind it, unless %git says otherwise for its path.  Each command that
+# writes goes to @WROTE, and the tips of the source that release_state
+# sees go to %TIPS.
+my ( %git, @WROTE, %TIPS );
+my $origin = { ref => 'refs/remotes/origin/main', name => 'origin/main', remote => 'origin' };
 my $source = Test::MockModule->new('App::BatchRelease::Source::Git');
 $source->redefine( is_checkout    => sub ($self) { return $git{ $self->root }{checkout} // 1 } );
 $source->redefine( default_branch => sub ($self) { return 'main' } );
 $source->redefine( current_branch => sub ($self) { return exists $git{ $self->root }{branch} ? $git{ $self->root }{branch} : 'main' } );
 $source->redefine( changes        => sub ($self) { return @{ $git{ $self->root }{changes} // [] } } );
+$source->redefine(
+    upstream => sub ( $self, $branch ) {
+        die $git{ $self->root }{upstream_error} if defined $git{ $self->root }{upstream_error};
+        return exists $git{ $self->root }{upstream} ? $git{ $self->root }{upstream} : $origin;
+    }
+);
+$source->redefine( divergence => sub ( $self, $branch, $ref ) { return @{ $git{ $self->root }{divergence} // [ 0, 0 ] } } );
+$source->redefine(
+    fetch => sub ( $self, $remote ) {
+        push @WROTE, "fetch $remote";
+        die $git{ $self->root }{fetch_error} if defined $git{ $self->root }{fetch_error};
+        return;
+    }
+);
+$source->redefine(
+    switch => sub ( $self, $branch ) {
+        push @WROTE, "switch $branch";
+        $git{ $self->root }{branch} = $branch;
+        return;
+    }
+);
+$source->redefine(
+    pull => sub ($self) {
+        push @WROTE, 'pull';
+        die $git{ $self->root }{pull_error} if defined $git{ $self->root }{pull_error};
+        $git{ $self->root }{divergence} = [ 0, 0 ];
+        return;
+    }
+);
 my $state = Test::MockModule->new('App::BatchRelease::State');
 $state->redefine(
     release_state => sub ( $checkout, $cpan ) {
         my $name = Mojo::File->new( $checkout->root )->basename;
         die "MetaCPAN GET /release/versions/$name: 500 Internal Server Error\n" if $git{ $checkout->root }{broken};
+        %TIPS = %{ $checkout->tips };
         return { repo => $checkout->id, %{ $STATE{$name} } };
     }
 );
@@ -102,6 +136,61 @@ subtest inspect => sub {
     is( $app->inspect($base)->{skip}, undef, 'without conformant_only, conformance does not matter' );
     $app->conformant_only(1);
     is( $app->inspect($base)->{skip}, 'not in full conformance: GitHooks fails', 'with it, a distribution that does not conform is skipped' );
+};
+
+subtest sync => sub {
+    my $base = "$dir{'Test-Base'}";
+
+    # inspect $base with the git state %$given, by an app with %options, and
+    # gives the entry; @WROTE and %TIPS then say what it wrote and read.
+    my sub look ( $given, %options ) {
+        $git{$base} = {%$given};
+        ( @WROTE, %TIPS ) = ();
+        return App::BatchRelease->new(%options)->inspect($base);
+    }
+
+    is( look( {} ),                                               { path => $base, repo => $base, %{ $STATE{'Test-Base'} } }, '0 commits behind its upstream: due as before' );
+    is( \@WROTE,                                                  ['fetch origin'],                                           'after a fetch of the remote of the upstream' );
+    is( look( { divergence => [ 0, 1 ] } )->{skip},               '1 commit behind origin/main',                              '1 commit behind its upstream: skipped, so dzil release cannot upload an old tree' );
+    is( look( { divergence => [ 0, 2 ] } )->{skip},               '2 commits behind origin/main',                             'the count of commits behind' );
+    is( look( { divergence => [ 3, 0 ] } )->{skip},               undef,                                                      'ahead of its upstream: still due, because [Git::Push] pushes it' );
+    is( look( { divergence => [ 0, 1 ] }, dry_run => 1 )->{skip}, '1 commit behind origin/main',                              'a dry run fetches and skips too, without --pull-latest' );
+    is( \@WROTE,                                                  ['fetch origin'],                                           'a dry run fetches' );
+
+    is( look( { upstream => undef } )->{skip}, 'its default branch main has no upstream, so nothing can tell whether it is behind; git branch --set-upstream-to gives it one', 'no upstream: skipped, with how to give it one' );
+    is( \@WROTE,                               [],                                                                                                                             'and nothing to fetch' );
+    is(
+        look( { fetch_error => "git fetch --quiet origin in /bogus: exit 128: fatal: unable to access the remote\nmore\n" } )->{skip},
+        'git fetch origin failed, so nothing can tell whether main is behind origin/main: git fetch --quiet origin in /bogus: exit 128: fatal: unable to access the remote',
+        'a failed fetch: skipped, with the first line of the error'
+    );
+    is( look( { upstream_error => "git for-each-ref in /bogus: exit 128: fatal: bad object\n" } )->{skip}, 'the check of its default branch against its upstream failed: git for-each-ref in /bogus: exit 128: fatal: bad object', 'a check that dies: skipped, with why' );
+
+    my %pull = ( pull_latest => 1 );
+    is( look( { divergence => [ 0, 2 ], branch => 'topic' }, %pull ),       { path => $base, repo => $base, %{ $STATE{'Test-Base'} } }, '--pull-latest: on another branch and behind, it is brought up to date, and due' );
+    is( \@WROTE,                                                            [ 'fetch origin', 'switch main', 'pull' ],                  'by a checkout of the default branch, then a pull' );
+    is( look( { divergence => [ 0, 1 ], branch => undef }, %pull )->{skip}, undef,                                                      'a detached head is checked out too' );
+    is( \@WROTE,                                                            [ 'fetch origin', 'switch main', 'pull' ],                  'and pulled' );
+    is( look( { divergence => [ 2, 0 ] }, %pull )->{skip},                  undef,                                                      'on the default branch and ahead: due' );
+    is( \@WROTE,                                                            ['fetch origin'],                                           'with nothing to check out or pull' );
+
+    is( look( { divergence => [ 0, 1 ], changes => ['?? junk'] }, %pull )->{skip},             '1 changed or untracked path in the work tree, so --pull-latest cannot fast-forward 1 commit', 'a dirty work tree that would be pulled: skipped' );
+    is( \@WROTE,                                                                               ['fetch origin'],                                                                              'and not pulled' );
+    is( look( { branch => 'topic', changes => [ ' M dist.ini', '?? junk' ] }, %pull )->{skip}, '2 changed or untracked paths in the work tree, so --pull-latest cannot check out main',       'a dirty work tree that would change branch: skipped' );
+    is( \@WROTE,                                                                               ['fetch origin'],                                                                              'and not checked out' );
+    is( look( { changes => ['?? junk'] }, %pull )->{skip},                                     '1 changed or untracked path in the work tree, which dzil release refuses',                    'a dirty work tree with nothing to pull is skipped as before' );
+
+    is( look( { divergence => [ 1, 2 ] }, %pull )->{skip},                                                                                                 '2 commits behind origin/main and 1 commit ahead of it, so it cannot fast-forward',                                            'behind and ahead at once: skipped, because it cannot fast-forward' );
+    is( \@WROTE,                                                                                                                                           ['fetch origin'],                                                                                                              'and not pulled' );
+    is( look( { divergence => [ 0, 1 ], pull_error => "git pull in /bogus: exit 128: fatal: Not possible to fast-forward, aborting.\n" }, %pull )->{skip}, '--pull-latest could not fast-forward 1 commit: git pull in /bogus: exit 128: fatal: Not possible to fast-forward, aborting.', 'a pull that git refuses: skipped, with why' );
+
+    my $entry = look( { divergence => [ 0, 2 ], branch => 'topic' }, %pull, dry_run => 1 );
+    is( [ @{$entry}{qw{skip pull}} ], [ undef, 'check out main and fast-forward 2 commits' ], '--dry-run --pull-latest: says what the pull would do, and the branch it is on does not skip it' );
+    is( \@WROTE,                      ['fetch origin'],                                       'and does nothing but fetch' );
+    is( \%TIPS,                       { main => 'refs/remotes/origin/main' },                 'and gives the state that the fast-forward would give, from the upstream' );
+    $entry = look( { branch => 'topic' }, %pull, dry_run => 1 );
+    is( [ $entry->{pull}, \%TIPS ], [ 'check out main', {} ], 'only a checkout to do: the state of the default branch as it is' );
+    $git{$base} = {};
 };
 
 subtest conformance_problem => sub {
@@ -282,6 +371,28 @@ SUMMARY
 
     ( $out, $err, $status ) = capture { App::BatchRelease->new->run("$dir{'Test-Other'}") };
     is( start( $out, "Nothing to release.\n" ), "Nothing to release.\n", 'nothing due: it says so' );
+
+    @WROTE                     = ();
+    $git{"$dir{'Test-Base'}"}  = { divergence => [ 0, 2 ] };
+    $git{"$dir{'Test-Other'}"} = { branch     => 'topic' };
+    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( '--dry-run', '--pull-latest', @paths ) };
+    is(
+        [ $status, $out ],
+        [
+            0, <<"LIST"
+Would release, in this order:
+  1. Test-Base 0.002: not uploaded, CPAN has 0.001; would fast-forward 2 commits first
+       $dir{'Test-Base'}
+  2. Test-App 1.000: never released; after Test-Base
+       $dir{'Test-App'}
+Skipped:
+  Test-Other ($dir{'Test-Other'}): released: CPAN has 0.010, and the default branch has nothing after its tag; would check out main first
+LIST
+        ],
+        '--dry-run --pull-latest says what each pull would do, of those to release and of those to skip'
+    );
+    is( \@WROTE, [ ('fetch origin') x 3 ], 'and only fetches' );
+    $git{$_} = {} for "$dir{'Test-Base'}", "$dir{'Test-Other'}";
 
     $credentials->redefine( ask => sub ($self) { die "Nobody can type the PAUSE credentials.\n" } );
     my $warned = warning {
