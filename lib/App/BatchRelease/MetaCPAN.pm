@@ -59,17 +59,51 @@ sub get ( $self, $path ) {
     return $res->json;
 }
 
+=attr releases_of
+
+The answers of L</releases>, by distribution.  Each object asks MetaCPAN once
+for a distribution, and keeps the answer for its life.
+
+=cut
+
+has releases_of => sub { {} };
+
+=method releases
+
+C<($dist)>.  Each release of the distribution, newest first, as MetaCPAN
+gives it: a hash reference with C<version>, C<author>, C<status> and more.
+That includes a release that was deleted from CPAN and is on BackPAN only.  A
+distribution that MetaCPAN does not know has none.  It asks once for each
+distribution, as L</releases_of> says, and an error is not kept.
+
+=cut
+
+sub releases ( $self, $dist ) {
+    return $self->releases_of->{$dist} //= $self->get( '/release/versions/' . Mojo::Util::url_escape($dist) )->{releases} // [];
+}
+
 =method versions
 
-C<($dist)>.  The version of each release of the distribution, newest first.
-That includes a release that was deleted from CPAN and is on BackPAN only,
-because PAUSE never takes that version of the distribution again.  A
-distribution that MetaCPAN does not know has none.
+C<($dist)>.  The version of each of L</releases>, newest first.  It counts a
+release that is on BackPAN only, because PAUSE never takes that version of
+the distribution again.
 
 =cut
 
 sub versions ( $self, $dist ) {
-    return [ map { $_->{version} } @{ $self->get( '/release/versions/' . Mojo::Util::url_escape($dist) )->{releases} // [] } ];
+    return [ map { $_->{version} } @{ $self->releases($dist) } ];
+}
+
+=method latest_author
+
+C<($dist)>.  The PAUSE ID that uploaded the newest of L</releases>.  Undef
+when the distribution has no release.
+
+=cut
+
+sub latest_author ( $self, $dist ) {
+    my ($newest) = @{ $self->releases($dist) };
+    return $newest ? $newest->{author} : undef;
 }
 
 1;
@@ -87,7 +121,7 @@ sub versions ( $self, $dist ) {
 A blocking client of the MetaCPAN API, which needs no token, over
 L<Mojo::UserAgent>.  L<App::BatchRelease::State/release_state> takes any
 object with a L</versions> method, so a caller that has its own client, such
-as App::Clod, passes that one.  Each error message ends in a newline, so perl
+as App::Clod, passes that one.  Each error message ends in a newline, so C<perl>
 adds no file and line to it, and it can be shown as it is.
 
 =cut

@@ -14,14 +14,15 @@ __END__
 
 =head1 SYNOPSIS
 
-    batch-release [--dry-run] [--conformant-only] [--credentials] [--yes]
+    batch-release --author PAUSEID [--author PAUSEID]... [--dry-run]
+                  [--conformant-only] [--credentials] [--yes]
                   [--skip-login-check] [--pull-latest] [--jobs N] CHECKOUT...
 
-    batch-release --dry-run ~/src/*
-    batch-release --dry-run --pull-latest ~/src/*
-    batch-release --conformant-only ~/src/*
+    batch-release --author TESTER --dry-run ~/src/*
+    batch-release --author TESTER --dry-run --pull-latest ~/src/*
+    batch-release --author TESTER --conformant-only ~/src/*
     printf 'username: %s\npassword: %s\n\n' "$PAUSE_USER" "$PAUSE_PASSWORD" \
-        | batch-release --credentials --yes ~/src/*
+        | batch-release --author TESTER --credentials --yes ~/src/*
 
 =head1 DESCRIPTION
 
@@ -40,6 +41,13 @@ tree while it looks, unless C<--pull-latest> tells it to:
 
 A path that is not a directory, has no F<dist.ini>, or is not the top of a
 git checkout is skipped.
+
+=item *
+
+A fork is skipped: a distribution whose newest release on CPAN another PAUSE
+author uploaded, one that no C<--author> names.  This check comes before the
+fetch, so a fork is neither fetched nor pulled.  A distribution that was never
+released is not a fork.
 
 =item *
 
@@ -96,6 +104,13 @@ distributions released, skipped, with the reason, and failed, with the error.
 =head1 OPTIONS
 
 =over
+
+=item --author PAUSEID
+
+The PAUSE ID of an author whose distributions to release.  Give it once for
+each author, for example for each co-maintainer who uploads.  Case does not
+matter.  It is required.  A checkout whose newest release on CPAN is by
+another author is a fork, and is skipped.
 
 =item --dry-run, -n
 

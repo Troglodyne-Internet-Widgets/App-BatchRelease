@@ -84,6 +84,18 @@ $state->redefine(
     }
 );
 
+# The PAUSE ID of the newest release of each distribution on CPAN, by its
+# name.  A distribution that is not here has no release.  An author of
+# 'broken' makes MetaCPAN fail.
+my %AUTHOR = ( 'Test-Base' => 'TESTER', 'Test-Other' => 'TESTER' );
+my $cpan   = Test::MockModule->new('App::BatchRelease::MetaCPAN');
+$cpan->redefine(
+    latest_author => sub ( $self, $dist ) {
+        die "MetaCPAN GET /release/versions/$dist: 500 Internal Server Error\n" if ( $AUTHOR{$dist} // q{} ) eq 'broken';
+        return $AUTHOR{$dist};
+    }
+);
+
 # Fakes the prerequisites: Test-App requires Test::Base, which Test-Base provides.
 my $prereqs = Test::MockModule->new('App::BatchRelease::Prereqs');
 $prereqs->redefine( provides => sub ($root) { return [ Mojo::File->new($root)->basename =~ s{-}{::}r ] } );
@@ -110,8 +122,36 @@ subtest due => sub {
     is( App::BatchRelease::due( { state => 'no_version' } ), 'its dist.ini sets no version and does not load [Git::NextVersion], so nothing can tell what is released', 'no version is not due' );
 };
 
+subtest fork_reason => sub {
+    my $app  = App::BatchRelease->new( authors => ['TESTER'] );
+    my $base = "$dir{'Test-Base'}";
+    is( $app->fork_reason($base),                                                    undef, 'a distribution whose newest release is by one of the authors is not a fork' );
+    is( $app->fork_reason("$dir{'Test-App'}"),                                       undef, 'nor is a distribution with no release' );
+    is( App::BatchRelease->new( authors => [qw{OTHER TESTER}] )->fork_reason($base), undef, 'any one of several authors will do' );
+    is(
+        App::BatchRelease->new( authors => ['OTHER'] )->fork_reason($base),
+        'the newest release of Test-Base on CPAN is by TESTER, and --author does not name TESTER, so this checkout is a fork',
+        'a distribution whose newest release is by somebody else is a fork, named by its distribution and that author'
+    );
+    is( App::BatchRelease->new->fork_reason($base), match(qr{so\ this\ checkout\ is\ a\ fork\z}), 'with no author at all, every released distribution is a fork' );
+
+    my $late = $dir{'Test-Late'}->child('dist.ini');
+    $AUTHOR{'Test-Late'} = 'OTHER';
+    $late->spew("this line is not ini\n");
+    is( $app->fork_reason("$dir{'Test-Late'}"), undef, 'a dist.ini that does not parse gives no reason, for release_state to report' );
+    $late->spew("version = 1\n");
+    is( $app->fork_reason("$dir{'Test-Late'}"), undef, 'nor does one that names no distribution' );
+    $late->spew("name = Test-Late\n");
+    is( start( $app->fork_reason("$dir{'Test-Late'}"), 'the newest release of Test-Late' ), 'the newest release of Test-Late', 'the name comes from the dist.ini of the work tree' );
+    delete $AUTHOR{'Test-Late'};
+
+    $AUTHOR{'Test-Base'} = 'broken';
+    is( dies { $app->fork_reason($base) }, "MetaCPAN GET /release/versions/Test-Base: 500 Internal Server Error\n", 'it dies when MetaCPAN fails' );
+    $AUTHOR{'Test-Base'} = 'TESTER';
+};
+
 subtest inspect => sub {
-    my $app  = App::BatchRelease->new;
+    my $app  = App::BatchRelease->new( authors => ['TESTER'] );
     my $base = "$dir{'Test-Base'}";
     is( $app->inspect('/bogus/nowhere')->{skip}, 'not a directory',                                      'a path that is not a directory' );
     is( $app->inspect("$dir{plain}")->{skip},    'no dist.ini, so it is not a Dist::Zilla distribution', 'a directory without dist.ini' );
@@ -121,6 +161,15 @@ subtest inspect => sub {
 
     $git{$base} = { broken => 1 };
     is( $app->inspect($base)->{skip}, 'the check of its state failed: MetaCPAN GET /release/versions/Test-Base: 500 Internal Server Error', 'a check that fails' );
+
+    $git{$base}          = {};
+    @WROTE               = ();
+    $AUTHOR{'Test-Base'} = 'OTHER';
+    is( $app->inspect($base), { path => $base, skip => 'the newest release of Test-Base on CPAN is by OTHER, and --author does not name OTHER, so this checkout is a fork' }, 'a fork is skipped with the reason of fork_reason' );
+    is( \@WROTE,              [],                                                                                                                                             'before anything fetches it' );
+    $AUTHOR{'Test-Base'} = 'broken';
+    is( $app->inspect($base)->{skip}, 'the check of its author on CPAN failed: MetaCPAN GET /release/versions/Test-Base: 500 Internal Server Error', 'a check of the author that fails' );
+    $AUTHOR{'Test-Base'} = 'TESTER';
 
     $git{$base} = {};
     is( $app->inspect($base),                                              { path => $base, repo => $base, %{ $STATE{'Test-Base'} } }, 'a distribution that is due has no skip' );
@@ -162,7 +211,7 @@ subtest inspect_all => sub {
 
     # The requirements name the process that read them.
     $prereqs->redefine( requires => sub ($root) { die "unreadable\n" if $root eq '/bogus/c'; return ["Pid::$$"] } );
-    my @entries = App::BatchRelease->new( jobs => 4 )->inspect_all(@paths);
+    my @entries = App::BatchRelease->new( jobs => 4, authors => ['TESTER'] )->inspect_all(@paths);
     is( [ map { $_->{path} } @entries ], \@paths, 'the entries come back in the order of the paths, whatever order the children finish in' );
     my %pids = map { $_->{pid} => 1 } grep { defined $_->{pid} } @entries;
     ok( keys(%pids) > 1 && !$pids{$$}, 'in more than one child process, and none in this one' ) or diag "this process $$, children " . join q{ }, keys %pids;
@@ -171,7 +220,7 @@ subtest inspect_all => sub {
     is( $entries[-1],         { path => '/bogus/d', skip => "its check failed: boom" },                                                  'a path whose inspect dies is skipped with the error, and its requirements are not read' );
     $prereqs->unmock('requires');
 
-    @entries = App::BatchRelease->new( jobs => 1 )->inspect_all(@paths);
+    @entries = App::BatchRelease->new( jobs => 1, authors => ['TESTER'] )->inspect_all(@paths);
     is( [ map { $_->{pid} } @entries[ 0 .. 2 ] ], [ ($$) x 3 ], 'with one job, every path is inspected in this process' );
 
     $mock->redefine(
@@ -182,7 +231,7 @@ subtest inspect_all => sub {
         }
     );
     my ( undef, $err ) = capture {
-        @entries = eval { App::BatchRelease->new( jobs => 2 )->inspect_all(@paths) }
+        @entries = eval { App::BatchRelease->new( jobs => 2, authors => ['TESTER'] )->inspect_all(@paths) }
     };
     is( $entries[0], { path => '/bogus/a', caught => 1, prereqs => { provides => ['a'], requires => [] } }, 'a die that inspect catches far below its eval does not end the child, when the run started in an eval as run does' );
     is( $entries[1], { path => '/bogus/b', skip => 'the process that checked it ended before it gave an answer' }, 'a path whose child ends without an answer is skipped' ) or diag $err;
@@ -196,7 +245,7 @@ subtest sync => sub {
     my sub look ( $given, %options ) {
         $git{$base} = {%$given};
         ( @WROTE, %TIPS ) = ();
-        return App::BatchRelease->new(%options)->inspect($base);
+        return App::BatchRelease->new( authors => ['TESTER'], %options )->inspect($base);
     }
 
     is( look( {} ),                                               { path => $base, repo => $base, %{ $STATE{'Test-Base'} } }, '0 commits behind its upstream: due as before' );
@@ -260,7 +309,7 @@ subtest conformance_problem => sub {
 
 subtest plan => sub {
     app_requires_base();
-    my $plan    = App::BatchRelease->new->plan( map { "$dir{$_}" } qw{Test-App plain Test-Base Test-Other Test-Copy} );
+    my $plan    = App::BatchRelease->new( authors => ['TESTER'] )->plan( map { "$dir{$_}" } qw{Test-App plain Test-Base Test-Other Test-Copy} );
     my @release = @{ $plan->{release} };
     is( [ map { $_->{name} } @release ], [qw{Test-Base Test-App}], 'the one that is required comes first, whatever the order of the paths' );
     is( $release[1]{needs},              ['Test-Base'],            'with what each requires of the batch' );
@@ -273,7 +322,7 @@ subtest plan => sub {
     # Test-App and Test-Base require each other, and Test-Late requires
     # Test-App.
     $prereqs->redefine( requires => sub ($root) { return Mojo::File->new($root)->basename eq 'Test-App' ? ['Test::Base'] : ['Test::App'] } );
-    $plan = App::BatchRelease->new->plan( map { "$dir{$_}" } qw{Test-App Test-Base Test-Late} );
+    $plan = App::BatchRelease->new( authors => ['TESTER'] )->plan( map { "$dir{$_}" } qw{Test-App Test-Base Test-Late} );
     is( $plan->{release}, [], 'two that require each other cannot be ordered, nor one that requires them' );
     is(
         [ map { $_->{skip} } @{ $plan->{skipped} } ],
@@ -285,7 +334,7 @@ subtest plan => sub {
     );
 
     $prereqs->redefine( requires => sub ($root) { die "Cannot read the prerequisites of $root/lib/X.pm: PPI parse failed\n" if Mojo::File->new($root)->basename eq 'Test-Base'; return ['Test::Base'] } );
-    $plan = App::BatchRelease->new->plan( map { "$dir{$_}" } qw{Test-App Test-Base} );
+    $plan = App::BatchRelease->new( authors => ['TESTER'] )->plan( map { "$dir{$_}" } qw{Test-App Test-Base} );
     is( [ map { $_->{name} } @{ $plan->{release} } ], ['Test-App'],                                                                                                          'a distribution whose requirements cannot be read leaves the batch, and the others still go' );
     is( [ map { $_->{skip} } @{ $plan->{skipped} } ], ["its requirements could not be read: Cannot read the prerequisites of $dir{'Test-Base'}/lib/X.pm: PPI parse failed"], 'with the reason' );
 };
@@ -388,11 +437,11 @@ Skipped:
   Test-Other ($dir{'Test-Other'}): released: CPAN has 0.010, and the default branch has nothing after its tag
 LIST
 
-    my ( $out, $err, $status ) = capture { App::BatchRelease->new->run( '--dry-run', '--credentials', @paths ) };
+    my ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--author tester}, '--dry-run', '--credentials', @paths ) };
     is( [ $status, $out ], [ 0, "Would release, $list" ], 'a dry run lists what it would release, in order, with the state and the requirements of each, and what it would skip, with why, and exits 0' );
     is( [ \@released, \@calls ], [ [], [] ], 'and releases nothing, reads no credentials and asks nothing, even with --credentials' );
 
-    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( '--credentials', @paths ) };
+    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--author tester}, '--credentials', @paths ) };
     is( $status,    0,                                                         'a run where all went well exits 0' );
     is( \@calls,    [qw{load confirm ask check}],                              'the credentials block is read first, then the list is confirmed, then the credentials are asked for and checked, all before the first release' );
     is( \@released, [ [ 'Test-Base', 'hunter2' ], [ 'Test-App', 'hunter2' ] ], 'each release, in order, with the same credentials' );
@@ -410,16 +459,16 @@ SUMMARY
 
     ( @calls, @released ) = ();
     $confirmed = 0;
-    ( $out, $err, $status ) = capture { App::BatchRelease->new->run(@paths) };
+    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--author tester}, @paths ) };
     is( [ $status, \@calls, \@released ], [ 0, ['confirm'], [] ],                       'not confirmed: nothing is asked or released' );
     is( $out,                             "To release, ${list}Nothing was released.\n", 'and it says so' );
 
     @calls = ();
     $release->redefine( release => sub ( $root, $credentials, %options ) { return { error => 'the release exited 1', built => undef } } );
-    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( '--yes', '--skip-login-check', @paths ) };
+    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--author tester}, '--yes', '--skip-login-check', @paths ) };
     is( [ $status, \@calls ], [ 1, ['ask'] ], 'with --yes nothing is confirmed, with --skip-login-check nothing is checked, and a failure exits 1' );
 
-    ( $out, $err, $status ) = capture { App::BatchRelease->new->run("$dir{'Test-Other'}") };
+    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--author tester}, "$dir{'Test-Other'}" ) };
     is( start( $out, "Nothing to release.\n" ), "Nothing to release.\n", 'nothing due: it says so' );
 
     @WROTE                     = ();
@@ -427,7 +476,7 @@ SUMMARY
     $git{"$dir{'Test-Other'}"} = { branch     => 'topic' };
 
     # One job, because what a child process writes into @WROTE stays in the child.
-    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--dry-run --pull-latest --jobs 1}, @paths ) };
+    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--author tester}, qw{--dry-run --pull-latest --jobs 1}, @paths ) };
     is(
         [ $status, $out ],
         [
@@ -448,7 +497,7 @@ LIST
 
     $credentials->redefine( ask => sub ($self) { die "Nobody can type the PAUSE credentials.\n" } );
     my $warned = warning {
-        ( $out, $err, $status ) = capture { App::BatchRelease->new->run( '--yes', @paths ) }
+        ( $out, $err, $status ) = capture { App::BatchRelease->new->run( qw{--author tester}, '--yes', @paths ) }
     };
     is( [ $status, $warned ], [ 2, "Nobody can type the PAUSE credentials.\n" ], 'a run that cannot get the credentials stops with 2, before any release, and warns why' );
 
@@ -456,6 +505,9 @@ LIST
     local $0 = Mojo::File->new( $Bin, q{..}, qw{script batch-release} )->to_string;
     ( $out, $err, $status ) = capture { App::BatchRelease->new->run() };
     is( [ $status, start( $err, "Name at least one checkout.\n\nUsage:" ) ], [ 2, "Name at least one checkout.\n\nUsage:" ], 'no checkout is a mistake in the arguments, which it explains, with the usage' );
+    @WROTE = ();
+    ( $out, $err, $status ) = capture { App::BatchRelease->new->run( '--dry-run', @paths ) };
+    is( [ $status, start( $err, "Name your PAUSE ID with --author.\n\nUsage:" ), \@WROTE ], [ 2, "Name your PAUSE ID with --author.\n\nUsage:", [] ], 'no --author is a mistake in the arguments too, and nothing is fetched' );
     like(
         warning {
             ( $out, $err, $status ) = capture { App::BatchRelease->new->run('--bogus') }
