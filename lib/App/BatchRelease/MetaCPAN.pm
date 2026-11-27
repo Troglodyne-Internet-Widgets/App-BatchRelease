@@ -10,6 +10,7 @@ use Mojo::Base -base, -signatures;
 use Mojo::URL       ();
 use Mojo::UserAgent ();
 use Mojo::Util      ();
+use Sub::Retry      qw{retry};
 
 =attr api
 
@@ -39,17 +40,36 @@ has ua => sub ($self) {
     return $ua;
 };
 
+=attr attempts
+
+How many times L</get> sends a request that gets no answer.
+
+=cut
+
+has attempts => 2;
+
+=attr retry_delay
+
+Seconds between two of those L</attempts>.
+
+=cut
+
+has retry_delay => 1;
+
 =method get
 
-C<($path)>.  The decoded JSON of the answer.  It dies with "no response" and
-the transport error when no answer came, and with the status and the message
-for an answer of 400 or more.
+C<($path)>.  The decoded JSON of the answer.  When no answer comes, such as
+after a connect timeout, it sends the request again, up to L</attempts> in
+all, and then dies with "no response" and the transport error.  For an answer
+of 400 or more it does not send again, and dies with the status and the
+message.
 
 =cut
 
 sub get ( $self, $path ) {
     my $url = Mojo::URL->new( $self->api . $path );
-    my $tx  = $self->ua->get($url);
+    my $tx;
+    retry $self->attempts, $self->retry_delay, sub { $tx = $self->ua->get($url) }, sub { !$tx->res->code };
     my $res = $tx->res;
     die "MetaCPAN GET $url: no response: " . ( $tx->error->{message} // 'unknown' ) . "\n" if !$res->code;
     if ( $res->code >= 400 ) {
