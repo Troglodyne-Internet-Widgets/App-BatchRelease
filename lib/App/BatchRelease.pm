@@ -8,6 +8,7 @@ use warnings FATAL => 'all';
 use re '/aasx';
 use Mojo::Base -base, -signatures;
 
+use Config::INI::Reader();
 use Getopt::Long();
 use List::Util();
 use MCE::Loop;
@@ -28,7 +29,7 @@ use App::BatchRelease::State();
     use 5.040;
     use App::BatchRelease;
 
-    exit App::BatchRelease->new->run( '--dry-run', '/bogus/Foo-Bar', '/bogus/Foo-Baz' );
+    exit App::BatchRelease->new->run( qw{--author TESTER --dry-run}, '/bogus/Foo-Bar', '/bogus/Foo-Baz' );
 
 =head1 DESCRIPTION
 
@@ -104,6 +105,14 @@ upstream is skipped.
 How many checkouts L</inspect_all> inspects at once.  Default 8.  1 inspects
 them one after another, in this process.
 
+=attr authors
+
+An array reference of the PAUSE IDs whose distributions this run releases,
+in capitals.  L</inspect> skips a checkout whose newest release on CPAN
+another author uploaded, because that checkout is a fork.  L</run> refuses
+to start without one.  Default none, and then every distribution on CPAN is
+somebody else's.
+
 =cut
 
 has cpan            => sub { App::BatchRelease::MetaCPAN->new };
@@ -114,6 +123,7 @@ has yes             => 0;
 has check_login     => 1;
 has pull_latest     => 0;
 has jobs            => 8;
+has authors         => sub { [] };
 
 # The answers that confirm a release.
 our %YES = map { $_ => 1 } qw{y yes};
@@ -129,8 +139,8 @@ release, such as an unanswered question or credentials that PAUSE refused.
 
 sub run ( $self, @arguments ) {
     my %options;
-    my $parsed  = Getopt::Long::GetOptionsFromArray( \@arguments, \%options, qw{dry-run|n conformant-only credentials yes|y skip-login-check pull-latest jobs|j=i help|h} );
-    my $problem = !$parsed ? q{} : !@arguments && !$options{help} ? "Name at least one checkout.\n" : undef;
+    my $parsed  = Getopt::Long::GetOptionsFromArray( \@arguments, \%options, qw{dry-run|n conformant-only credentials yes|y skip-login-check pull-latest jobs|j=i author=s@ help|h} );
+    my $problem = !$parsed ? q{} : $options{help} ? undef : !@arguments ? "Name at least one checkout.\n" : !$options{author} ? "Name your PAUSE ID with --author.\n" : undef;
     if ( defined $problem || $options{help} ) {
         Pod::Usage::pod2usage( -message => $problem, -exitval => 'NOEXIT', -verbose => 1, -output => defined $problem ? \*STDERR : \*STDOUT );
         return defined $problem ? 2 : 0;
@@ -141,6 +151,7 @@ sub run ( $self, @arguments ) {
     $self->check_login( $options{'skip-login-check'} ? 0 : 1 );
     $self->pull_latest( $options{'pull-latest'} // 0 );
     $self->jobs( $options{jobs} ) if defined $options{jobs};
+    $self->authors( [ map { uc } @{ $options{author} } ] );
 
     my $result = eval {
         $self->credentials->load if $options{credentials} && !$self->dry_run;
@@ -269,6 +280,11 @@ checkout, so it is not clearly a Dist::Zilla distribution;
 
 =item *
 
+it is a fork, as L</fork_reason> says, or the check of that fails.  This
+comes before the fetch, so a fork is neither fetched nor pulled;
+
+=item *
+
 L</sync> gives a reason: the fetch failed, the default branch has no
 upstream, or it is behind its upstream and L</pull_latest> cannot bring it
 up to date;
@@ -312,6 +328,10 @@ sub inspect ( $self, $path ) {
     my $source = App::BatchRelease::Source::Git->new( root => $path );
     return { %entry, skip => 'not the top of a git checkout' } if !$source->is_checkout;
 
+    my $fork = eval { $self->fork_reason($path) };
+    return { %entry, skip => 'the check of its author on CPAN failed: ' . first_line($@) } if !defined $fork && $@;
+    return { %entry, skip => $fork }                                                       if defined $fork;
+
     my $sync = eval { $self->sync($source) };
     return { %entry, skip => 'the check of its default branch against its upstream failed: ' . first_line($@) } if !$sync;
     return { %entry, skip => $sync->{skip} }                                                                    if defined $sync->{skip};
@@ -334,6 +354,25 @@ sub inspect ( $self, $path ) {
         return { %entry, skip => $problem };
     }
     return \%entry;
+}
+
+=method fork_reason
+
+C<($path)>.  Why the checkout C<$path> is a fork: the newest release of its
+distribution on CPAN is by a PAUSE ID that L</authors> does not name.  Undef
+when one of L</authors> uploaded that release, or when the distribution has
+no release.  It reads the name from the F<dist.ini> of the work tree, before
+any fetch.  When that file does not parse or names no distribution, it gives
+undef, and L<App::BatchRelease::State/release_state> reports the problem
+later.  It dies when MetaCPAN fails.
+
+=cut
+
+sub fork_reason ( $self, $path ) {
+    my $name   = eval { Config::INI::Reader->read_file("$path/dist.ini")->{_}{name} } // return;
+    my $author = $self->cpan->latest_author($name)                                    // return;
+    return if List::Util::any { $_ eq $author } @{ $self->authors };
+    return "the newest release of $name on CPAN is by $author, and --author does not name $author, so this checkout is a fork";
 }
 
 =method sync
