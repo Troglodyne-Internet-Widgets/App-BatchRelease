@@ -159,11 +159,17 @@ subtest inspect_all => sub {
             return { path => $path, pid => $$ };
         }
     );
+
+    # The requirements name the process that read them.
+    $prereqs->redefine( requires => sub ($root) { die "unreadable\n" if $root eq '/bogus/c'; return ["Pid::$$"] } );
     my @entries = App::BatchRelease->new( jobs => 4 )->inspect_all(@paths);
     is( [ map { $_->{path} } @entries ], \@paths, 'the entries come back in the order of the paths, whatever order the children finish in' );
     my %pids = map { $_->{pid} => 1 } grep { defined $_->{pid} } @entries;
     ok( keys(%pids) > 1 && !$pids{$$}, 'in more than one child process, and none in this one' ) or diag "this process $$, children " . join q{ }, keys %pids;
-    is( $entries[-1], { path => '/bogus/d', skip => "its check failed: boom" }, 'a path whose inspect dies is skipped with the error' );
+    is( $entries[0]{prereqs}, { provides => ['a'], requires => ["Pid::$entries[0]{pid}"] },                                              'the child that inspects a path also reads its requirements' );
+    is( $entries[2],          { path => '/bogus/c', pid => $entries[2]{pid}, skip => 'its requirements could not be read: unreadable' }, 'a path whose requirements cannot be read is skipped with the error' );
+    is( $entries[-1],         { path => '/bogus/d', skip => "its check failed: boom" },                                                  'a path whose inspect dies is skipped with the error, and its requirements are not read' );
+    $prereqs->unmock('requires');
 
     @entries = App::BatchRelease->new( jobs => 1 )->inspect_all(@paths);
     is( [ map { $_->{pid} } @entries[ 0 .. 2 ] ], [ ($$) x 3 ], 'with one job, every path is inspected in this process' );
@@ -178,8 +184,8 @@ subtest inspect_all => sub {
     my ( undef, $err ) = capture {
         @entries = eval { App::BatchRelease->new( jobs => 2 )->inspect_all(@paths) }
     };
-    is( $entries[0], { path => '/bogus/a', caught => 1 },                                                            'a die that inspect catches far below its eval does not end the child, when the run started in an eval as run does' );
-    is( $entries[1], { path => '/bogus/b', skip   => 'the process that checked it ended before it gave an answer' }, 'a path whose child ends without an answer is skipped' ) or diag $err;
+    is( $entries[0], { path => '/bogus/a', caught => 1, prereqs => { provides => ['a'], requires => [] } }, 'a die that inspect catches far below its eval does not end the child, when the run started in an eval as run does' );
+    is( $entries[1], { path => '/bogus/b', skip => 'the process that checked it ended before it gave an answer' }, 'a path whose child ends without an answer is skipped' ) or diag $err;
 };
 
 subtest sync => sub {

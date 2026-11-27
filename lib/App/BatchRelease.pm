@@ -178,8 +178,9 @@ second checkout of a distribution that an earlier path already gave.
 =cut
 
 sub plan ( $self, @paths ) {
-    my ( %due, @skipped );
+    my ( %due, %graph, @skipped );
     for my $entry ( $self->inspect_all(@paths) ) {
+        my $prereqs = delete $entry->{prereqs};
         if ( defined $entry->{skip} ) {
             push @skipped, $entry;
         }
@@ -187,16 +188,9 @@ sub plan ( $self, @paths ) {
             push @skipped, { %$entry, skip => "$first->{path} is a checkout of the same distribution, and comes first" };
         }
         else {
-            $due{ $entry->{name} } = $entry;
+            $due{ $entry->{name} }   = $entry;
+            $graph{ $entry->{name} } = $prereqs;
         }
-    }
-
-    my %graph;
-    for my $name ( sort keys %due ) {
-        my $root = $due{$name}{path};
-        my $ok   = eval { $graph{$name} = { provides => App::BatchRelease::Prereqs::provides($root), requires => App::BatchRelease::Prereqs::requires($root) }; 1 };
-        next if $ok;
-        push @skipped, { %{ delete $due{$name} }, skip => 'its requirements could not be read: ' . first_line($@) };
     }
     my $order = App::BatchRelease::Prereqs::order( \%graph );
     for my $name ( sort keys %{ $order->{cycles} } ) {
@@ -212,19 +206,28 @@ sub plan ( $self, @paths ) {
 =method inspect_all
 
 C<(@paths)>.  Returns what L</inspect> returns for each path, in the order of
-the paths.  Up to L</jobs> child processes inspect the paths at once, each
-path in one of them, because the check of one path does not depend on
-another.  With one job, or with one path, it inspects them in this process.
-If L</inspect> dies for a path, the entry of that path is skipped with the
-error.  If the process that inspects a path ends before it returns an entry,
-the entry of that path is skipped too.
+the paths.  An entry that is not skipped also has C<prereqs>, a hash
+reference of C<provides> and C<requires>, as
+L<App::BatchRelease::Prereqs/provides> and
+L<App::BatchRelease::Prereqs/requires> return them for the path.  An entry
+whose requirements cannot be read is skipped with the error.
+
+Up to L</jobs> child processes inspect the paths at once, each path in one
+of them, because the check of one path does not depend on another.  With one
+job, or with one path, it inspects them in this process.  If L</inspect>
+dies for a path, the entry of that path is skipped with the error.  If the
+process that inspects a path ends before it returns an entry, the entry of
+that path is skipped too.
 
 =cut
 
 sub inspect_all ( $self, @paths ) {
     my $inspect = sub ($path) {
-        my $entry = eval { $self->inspect($path) };
-        return $entry // { path => $path, skip => 'its check failed: ' . first_line($@) };
+        my $entry = eval { $self->inspect($path) } // return { path => $path, skip => 'its check failed: ' . first_line($@) };
+        return $entry if defined $entry->{skip};
+        my $prereqs = eval { +{ provides => App::BatchRelease::Prereqs::provides($path), requires => App::BatchRelease::Prereqs::requires($path) } };
+        return { %$entry, skip    => 'its requirements could not be read: ' . first_line($@) } if !$prereqs;
+        return { %$entry, prereqs => $prereqs };
     };
     my $workers = List::Util::min( $self->jobs, scalar @paths );
     if ( $workers < 2 ) {
