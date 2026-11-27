@@ -5,6 +5,8 @@ use re '/aasx';
 use Test2::V0;
 use Test2::Plugin::NoWarnings;
 use Mojolicious();
+use Mojo::Transaction::HTTP();
+use Test::MockModule;
 use FindBin::libs;
 
 use App::BatchRelease::MetaCPAN();
@@ -53,10 +55,38 @@ subtest latest_author => sub {
     is( $seen{asked}{'Test-Dist'},               2,                                           'because the answers belong to the object' );
 };
 
+subtest get => sub {
+    my $lost = 0;
+    my $sent = 0;
+    my $ua   = Test::MockModule->new('Mojo::UserAgent');
+    my $real = $ua->original('get');
+    $ua->redefine(
+        get => sub ( $self, @args ) {
+            $sent++;
+            return $real->( $self, @args ) if $lost-- <= 0;
+            my $tx = Mojo::Transaction::HTTP->new;
+            $tx->res->error( { message => 'Connect timeout' } );
+            return $tx;
+        }
+    );
+
+    $lost = 1;
+    is( fake_cpan()->retry_delay(0)->versions('Test-Dist'), [qw{0.002 0.001}], 'a request that got no answer is sent again, and the second answer counts' );
+    is( $sent,                                              2,                 'so two requests went out' );
+
+    ( $lost, $sent ) = ( 5, 0 );
+    is( dies { fake_cpan()->retry_delay(0)->versions('Test-Dist') }, match(qr{no\ response:\ Connect\ timeout\n\z}), 'after attempts requests with no answer it dies with the transport error' );
+    is( $sent,                                                       2,                                              'and sends no more than attempts requests' );
+
+    ( $lost, $sent ) = ( 0, 0 );
+    ok( dies { fake_cpan()->retry_delay(0)->versions('Broken-Dist') }, 'an error status dies' );
+    is( $sent, 1, 'and is not sent again, because MetaCPAN answered' );
+};
+
 subtest errors => sub {
     is( dies { $cpan->versions('Broken-Dist') }, "MetaCPAN GET /release/versions/Broken-Dist: 500 Internal Server Error\n", 'an error status dies with the status and the message, and no file or line' );
     is( dies { $cpan->versions('Broken-Dist') }, "MetaCPAN GET /release/versions/Broken-Dist: 500 Internal Server Error\n", 'and the error is not kept as an answer: the next call asks again and dies again' );
-    my $nowhere = App::BatchRelease::MetaCPAN->new( api => 'http://127.0.0.1:1', timeout => 2 );
+    my $nowhere = App::BatchRelease::MetaCPAN->new( api => 'http://127.0.0.1:1', timeout => 2, retry_delay => 0 );
     my $error   = dies { $nowhere->versions('Test-Dist') };
     my $want    = 'MetaCPAN GET http://127.0.0.1:1/release/versions/Test-Dist: no response: ';
     is( substr( $error, 0, length $want ), $want, 'no answer at all dies differently' );
